@@ -58,6 +58,7 @@ const EMAIL_VALIDATOR_CONFIG = Object.freeze({
   LAST_ERROR_PROPERTY: 'EMAIL_VALIDATOR_LAST_ERROR_V4',
   COMPANY_CACHE_INVALIDATION_PROPERTY: 'EMAIL_VALIDATOR_COMPANY_CACHE_INVALIDATED_V335',
   SEARCH_ADAPTER_CACHE_INVALIDATION_PROPERTY: 'EMAIL_VALIDATOR_SEARCH_ADAPTER_CACHE_INVALIDATED_V335_FIX1',
+  SOCIAL_HUB_CACHE_INVALIDATION_PROPERTY: 'EMAIL_VALIDATOR_SOCIAL_HUB_CACHE_INVALIDATED_V335_FIX1',
   CONTINUE_HANDLER: 'processEmailValidatorBatch',
   SOURCE_HEADERS_TO_COPY: [
     'Verification Date', 'No', 'Team', 'Position',
@@ -121,6 +122,11 @@ const FREE_EMAIL_DOMAINS_ = Object.freeze([
   'aol.com', 'proton.me', 'protonmail.com', 'ymail.com'
 ]);
 
+const SOCIAL_HUB_DOMAINS_ = Object.freeze([
+  'linktr.ee', 'lynk.id', 'bio.link', 'beacons.ai', 'taplink.cc',
+  'solo.to', 'campsite.bio', 'stan.store', 'about.me'
+]);
+
 const BLOCKED_OFFICIAL_DOMAINS_ = Object.freeze([
   'linkedin.com', 'facebook.com', 'instagram.com', 'tiktok.com', 'youtube.com',
   'jobstreet.co.id', 'jobstreet.com', 'glints.com', 'kalibrr.com', 'indeed.com',
@@ -130,7 +136,9 @@ const BLOCKED_OFFICIAL_DOMAINS_ = Object.freeze([
   'trip.com', 'traveloka.com', 'agoda.com', 'booking.com', 'expedia.com',
   'zomato.com', 'pergikuliner.com', 'restaurantguru.com', 'foursquare.com',
   'yelp.com', 'yellowpages.co.id', 'gofood.co.id', 'grab.com', 'shopee.co.id',
-  'tokopedia.com', 'semuabis.com', 'cybo.com', 'idalamat.com', 'carilokasi.com'
+  'tokopedia.com', 'semuabis.com', 'cybo.com', 'idalamat.com', 'carilokasi.com',
+  'linktr.ee', 'lynk.id', 'bio.link', 'beacons.ai', 'taplink.cc',
+  'solo.to', 'campsite.bio', 'stan.store', 'about.me'
 ]);
 
 // Alias institusi yang sering muncul di sumber publik Indonesia. Alias hanya
@@ -524,6 +532,7 @@ function processExplicitValidationRows_(ss, sourceSheet, rows, forceEmailRefresh
   const evidenceSheet = ensureEvidenceSheet_(ss);
   const companySheet = ensureCompanyMasterSheet_(ss);
   invalidateEmptyDiscoveryCacheOnce_(companySheet, rawSheet);
+  invalidateSocialHubFalsePositiveCacheOnce_(companySheet, rawSheet);
   const rawIndex = loadRawIndex_(rawSheet);
   const reviewIndex = loadReviewIndex_(reviewSheet);
   const evidenceIndex = loadReviewIndex_(evidenceSheet);
@@ -1220,6 +1229,49 @@ function invalidateEmptyDiscoveryCacheOnce_(companySheet, rawSheet) {
         !hasLegalEvidence && exactEmailFound !== 'FOUND';
 
       return [discoveryEmpty ? 'INVALIDATED_V335_SEARCH_FIX1' : currentVersion];
+    });
+
+    sheet.getRange(
+      EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW, versionCol, rowCount, 1
+    ).setValues(versions);
+  }
+
+  invalidateSheet(companySheet, true);
+  invalidateSheet(rawSheet, false);
+  properties.setProperty(marker, EMAIL_VALIDATOR_CONFIG.VERSION);
+}
+
+function invalidateSocialHubFalsePositiveCacheOnce_(companySheet, rawSheet) {
+  const properties = PropertiesService.getDocumentProperties();
+  const marker = EMAIL_VALIDATOR_CONFIG.SOCIAL_HUB_CACHE_INVALIDATION_PROPERTY;
+  if (properties.getProperty(marker) === EMAIL_VALIDATOR_CONFIG.VERSION) return;
+
+  function invalidateSheet(sheet, isCompanyMaster) {
+    if (!sheet || sheet.getLastRow() < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW) return;
+    const map = getHeaderMap_(sheet);
+    const versionCol = map['Validator Version'];
+    if (!versionCol) return;
+
+    const rowCount = sheet.getLastRow() - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW + 1;
+    const values = sheet.getRange(
+      EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW, 1, rowCount, sheet.getLastColumn()
+    ).getValues();
+    const versions = values.map(function (row) {
+      const currentVersion = cleanText_(row[versionCol - 1]);
+      const manualLock = isCompanyMaster && map['Manual Lock']
+        ? cleanText_(row[map['Manual Lock'] - 1]).toUpperCase()
+        : '';
+      if (manualLock === 'YES') return [currentVersion];
+
+      const website = map['Official Website'] ? cleanText_(row[map['Official Website'] - 1]) : '';
+      const domain = map['Official Domain'] ? cleanText_(row[map['Official Domain'] - 1]) : getDomain_(website);
+      const instagram = map['Instagram'] ? cleanText_(row[map['Instagram'] - 1]) : '';
+      const companyName = map['Company Name'] ? cleanText_(row[map['Company Name'] - 1]) : '';
+      const badWebsite = isSocialHubDomain_(domain) || isSocialHubDomain_(getDomain_(website));
+      const badInstagram = isInstagramVendorProfileForOtherCompany_(instagram, companyName);
+      return [badWebsite || badInstagram
+        ? 'INVALIDATED_V335_SOCIAL_HUB_FIX1'
+        : currentVersion];
     });
 
     sheet.getRange(
@@ -2859,7 +2911,7 @@ function findCompanyPresence_(companyName, location, runId) {
     if ((websiteFallback.score || 0) > (website.score || 0)) website = websiteFallback;
   }
   const linkedProfiles = website.status === 'MATCH' && website.url
-    ? extractSocialLinksFromWebsite_(website.url, runId)
+    ? extractSocialLinksFromWebsite_(website.url, companyName, runId)
     : { linkedin: '', instagram: '' };
 
   var linkedin;
@@ -3312,6 +3364,7 @@ function inferSocialProfile_(results, companyName, location, platform) {
     const title = normalizeText_(item.title || '');
     const description = normalizeText_(item.description || '');
     const slug = normalizeText_(getSocialSlug_(normalizedUrl, platform));
+    if (isInstagram && isInstagramVendorProfileForOtherCompany_(normalizedUrl, companyName)) return;
 
     // Identitas utama wajib datang dari TITLE/SLUG. Description dan lokasi
     // hanya dipakai sebagai konteks pendukung, khususnya untuk alias Instagram.
@@ -3394,7 +3447,7 @@ function inferSocialProfile_(results, companyName, location, platform) {
       };
 }
 
-function extractSocialLinksFromWebsite_(websiteUrl, runId) {
+function extractSocialLinksFromWebsite_(websiteUrl, companyName, runId) {
   const page = fetchPageHtml_(websiteUrl, runId);
   if (!page.html) return { linkedin: '', instagram: '' };
 
@@ -3410,7 +3463,12 @@ function extractSocialLinksFromWebsite_(websiteUrl, runId) {
   var instagram = '';
   hrefs.forEach(function (href) {
     if (!linkedin) linkedin = normalizeSocialProfileUrl_(href, 'LINKEDIN');
-    if (!instagram) instagram = normalizeSocialProfileUrl_(href, 'INSTAGRAM');
+    if (!instagram) {
+      const candidate = normalizeSocialProfileUrl_(href, 'INSTAGRAM');
+      if (candidate && !isInstagramVendorProfileForOtherCompany_(candidate, companyName)) {
+        instagram = candidate;
+      }
+    }
   });
 
   return { linkedin: linkedin, instagram: instagram };
@@ -3424,9 +3482,14 @@ function discoverInstagramFromTrustedEvidence_(results, companyName, location, o
     const evidenceUrl = cleanText_(item && item.url);
     if (!isTrustedSocialEvidenceUrl_(evidenceUrl, officialDomain)) return;
 
-    const evidenceText = normalizeText_([
-      item && item.title, item && item.description
-    ].join(' '));
+    const evidenceRawText = [
+      item && item.title,
+      item && item.description,
+      item && Array.isArray(item.extra_snippets)
+        ? item.extra_snippets.join(' ')
+        : ''
+    ].join(' ');
+    const evidenceText = normalizeText_(evidenceRawText);
     const identityMatch = getCompanyIdentityMatch_(identity, evidenceText, '');
     const fullIdentitySupported = identityMatch.fullNameSupported ||
       containsNormalizedPhrase_(evidenceText, identity.canonicalKey) ||
@@ -3434,22 +3497,27 @@ function discoverInstagramFromTrustedEvidence_(results, companyName, location, o
         requiredCompanyTokenMatches_(identity.fullNameTokens);
     if (!identityMatch.matched || !fullIdentitySupported) return;
 
+    var profileUrls = extractInstagramProfileUrlsFromText_(evidenceRawText);
     const page = fetchPageHtml_(evidenceUrl, runId);
-    if (!page.html) return;
-    const regex = /href\s*=\s*["']([^"']+)["']/gi;
-    var match;
-    var inspected = 0;
-    while (inspected < 500 && (match = regex.exec(page.html)) !== null) {
-      inspected++;
-      const profileUrl = normalizeSocialProfileUrl_(decodeHtmlEntities_(match[1]), 'INSTAGRAM');
-      if (!profileUrl) continue;
+    if (page.html) {
+      const regex = /href\s*=\s*["']([^"']+)["']/gi;
+      var match;
+      var inspected = 0;
+      while (inspected < 500 && (match = regex.exec(page.html)) !== null) {
+        inspected++;
+        const profileUrl = normalizeSocialProfileUrl_(decodeHtmlEntities_(match[1]), 'INSTAGRAM');
+        if (profileUrl) profileUrls.push(profileUrl);
+      }
+    }
+
+    unique_(profileUrls).forEach(function (profileUrl) {
       candidates.push({
         url: profileUrl,
         title: cleanText_(item.title),
         description: cleanText_(item.description),
         evidenceSource: evidenceUrl
       });
-    }
+    });
   });
 
   return inferSocialProfile_(candidates, companyName, location, 'INSTAGRAM');
@@ -3461,8 +3529,23 @@ function isTrustedSocialEvidenceUrl_(url, officialDomain) {
   const officialRoot = getRegistrableDomain_(officialDomain);
   if (!domain || !rootDomain) return false;
   if (officialRoot && rootDomain === officialRoot) return true;
-  if (rootDomain === 'unirank.org') return true;
+  if (rootDomain === 'unirank.org' || rootDomain === 'linkedin.com') return true;
+  if (isSocialHubDomain_(rootDomain)) return true;
   return /(?:^|\.)(?:go\.id|ac\.id|sch\.id|or\.id)$/i.test(domain);
+}
+
+function extractInstagramProfileUrlsFromText_(text) {
+  const value = decodeHtmlEntities_(text);
+  const profiles = [];
+  const regex = /(?:https?:\/\/)?(?:www\.)?instagram\.com\/([a-z0-9_](?:[a-z0-9._]*[a-z0-9_])?)/gi;
+  var match;
+  while ((match = regex.exec(value)) !== null && profiles.length < 20) {
+    const profile = normalizeSocialProfileUrl_(
+      'https://www.instagram.com/' + match[1] + '/', 'INSTAGRAM'
+    );
+    if (profile) profiles.push(profile);
+  }
+  return unique_(profiles);
 }
 
 function fetchPageHtml_(url, runId) {
@@ -3900,6 +3983,28 @@ function isBlockedOfficialDomain_(domain) {
   return BLOCKED_OFFICIAL_DOMAINS_.some(function (blocked) {
     return value === blocked || endsWithText_(value, '.' + blocked);
   });
+}
+
+function isSocialHubDomain_(domain) {
+  const rootDomain = getRegistrableDomain_(domain);
+  return SOCIAL_HUB_DOMAINS_.indexOf(rootDomain) !== -1;
+}
+
+function isInstagramVendorProfileForOtherCompany_(url, companyName) {
+  const username = getSocialSlug_(url, 'INSTAGRAM');
+  const usernameKey = normalizeText_(username).replace(/\s+/g, '');
+  const vendorKeys = [
+    'linktree', 'lynkid', 'biolink', 'beacons', 'beaconsai', 'taplink',
+    'soloto', 'campsitebio', 'stanstore', 'aboutme', 'instagram', 'meta'
+  ];
+  if (!usernameKey || vendorKeys.indexOf(usernameKey) === -1) return false;
+
+  // Akun milik platform hanya sah bila perusahaan yang dicari memang platform
+  // tersebut. Contoh: instagram.com/linktr.ee bukan akun DWJ Studio.
+  const companyKey = normalizeText_(companyName).replace(/\s+/g, '');
+  return !companyKey || (
+    companyKey.indexOf(usernameKey) === -1 && usernameKey.indexOf(companyKey) === -1
+  );
 }
 
 function isBlockedOfficialUrl_(url) {

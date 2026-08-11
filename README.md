@@ -18,3 +18,4 @@ Created from gas-tools extension
 - Metadata structured output hanya dipakai jika didukung URL source/citation aktual.
 - Koneksi OpenAI sementara (`Address unavailable`, timeout, 429 rate limit, dan 5xx) memakai bounded exponential-backoff retry; error autentikasi dan quota tidak diulang.
 - Instagram memakai direct full-name search lalu fallback link extraction dari website resmi, domain pemerintah/pendidikan, atau direktori universitas tepercaya dengan full-identity support.
+- Social hub seperti Linktree tidak boleh menjadi Official Website; akun vendor seperti `instagram.com/linktr.ee` ditolak, sementara profil brand dari LinkedIn/Linktree tetap memerlukan kecocokan identitas penuh.
