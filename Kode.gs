@@ -1,6 +1,6 @@
 /**
  * EMAIL VALIDATOR UNTUK GOOGLE SHEETS
- * Versi: 3.3.4 - alias-aware social/AHU matching + cache invalidation
+ * Versi: 3.3.5 - official root resolver + legal entity/AHU evidence
  *
  * Sumber data : sheet "Job Board"
  * Header wajib: "Company Name", "Contact Type", "Contact"
@@ -25,9 +25,9 @@
  */
 
 const EMAIL_VALIDATOR_CONFIG = Object.freeze({
-  VERSION: '3.3.4',
-  CACHE_COMPATIBLE_VERSIONS: ['3.2.0', '3.3.0', '3.3.2', '3.3.3', '3.3.4'],
-  COMPANY_CACHE_COMPATIBLE_VERSIONS: ['3.3.4'],
+  VERSION: '3.3.5',
+  CACHE_COMPATIBLE_VERSIONS: ['3.2.0', '3.3.0', '3.3.2', '3.3.3', '3.3.4', '3.3.5'],
+  COMPANY_CACHE_COMPATIBLE_VERSIONS: ['3.3.5'],
   JOB_SHEET_NAME: 'Job Board',
   SUMMARY_SHEET_NAME: 'Ringkasan Validasi',
   REVIEW_SHEET_NAME: 'Email Review',
@@ -53,7 +53,7 @@ const EMAIL_VALIDATOR_CONFIG = Object.freeze({
   BATCH_STATE_PROPERTY: 'EMAIL_VALIDATOR_BATCH_STATE_V4',
   SPREADSHEET_ID_PROPERTY: 'EMAIL_VALIDATOR_SPREADSHEET_ID_V4',
   LAST_ERROR_PROPERTY: 'EMAIL_VALIDATOR_LAST_ERROR_V4',
-  COMPANY_CACHE_INVALIDATION_PROPERTY: 'EMAIL_VALIDATOR_COMPANY_CACHE_INVALIDATED_V334',
+  COMPANY_CACHE_INVALIDATION_PROPERTY: 'EMAIL_VALIDATOR_COMPANY_CACHE_INVALIDATED_V335',
   CONTINUE_HANDLER: 'processEmailValidatorBatch',
   SOURCE_HEADERS_TO_COPY: [
     'Verification Date', 'No', 'Team', 'Position',
@@ -73,7 +73,9 @@ const EMAIL_VALIDATOR_CONFIG = Object.freeze({
     'LinkedIn Company', 'LinkedIn Match', 'Email on LinkedIn', 'LinkedIn Evidence',
     'Instagram', 'Instagram Match', 'Email on Instagram', 'Instagram Evidence',
     'AHU Status', 'AHU Registered Name', 'AHU Evidence',
-    'Other Email Evidence'
+    'Other Email Evidence',
+    'AHU Number', 'Legal Entity Name', 'Legal Relationship',
+    'Legal Evidence Source', 'Legal Confidence', 'Entity Type'
   ],
   COMPANY_HEADERS: [
     'Company Key', 'Company Name', 'Company Alias', 'Location',
@@ -81,7 +83,9 @@ const EMAIL_VALIDATOR_CONFIG = Object.freeze({
     'LinkedIn', 'LinkedIn Match', 'Instagram', 'Instagram Match',
     'AHU Status', 'AHU Registered Name', 'AHU Legal Form',
     'AHU Parent Entity', 'AHU Evidence', 'Company Status', 'Data Source',
-    'Validator Version', 'Last Checked', 'Manual Lock', 'Notes'
+    'Validator Version', 'Last Checked', 'Manual Lock', 'Notes',
+    'Entity Type', 'Legal Entity Name', 'Legal Entity Type',
+    'Legal Relationship', 'AHU Number', 'Legal Evidence Source', 'Legal Confidence'
   ],
   RAW_HEADERS: [
     'Source Row', 'Verification Date', 'No', 'Team', 'Position',
@@ -101,7 +105,9 @@ const EMAIL_VALIDATOR_CONFIG = Object.freeze({
     'Other Email Evidence',
     'Validation Score', 'Validation Status', 'Validation Notes',
     'Company Data Source', 'Email Data Source',
-    'Validator Version', 'Last Checked'
+    'Validator Version', 'Last Checked',
+    'Entity Type', 'Legal Entity Name', 'Legal Entity Type',
+    'Legal Relationship', 'AHU Number', 'Legal Evidence Source', 'Legal Confidence'
   ]
 });
 
@@ -135,7 +141,7 @@ const COMPANY_ALIAS_GROUPS_ = Object.freeze([
   {
     canonicalName: 'Universitas Muhammadiyah Metro',
     aliases: ['UM Metro', 'UMM Metro', 'Universitas Muhammadiyah Metro', 'Muhammadiyah Metro'],
-    domainStems: ['ummetro', 'um-metro']
+    domainStems: ['ummetro', 'um-metro', 'um_metro']
   }
 ]);
 
@@ -143,6 +149,11 @@ const AHU_LEGAL_FORM_TERMS_ = Object.freeze([
   'PT', 'CV', 'TBK', 'PERUM', 'BUMN', 'BUMD', 'YAYASAN', 'PERKUMPULAN',
   'KOPERASI', 'PERSYARIKATAN', 'ORGANISASI', 'BADAN HUKUM',
   'PERSEROAN TERBATAS', 'PERUSAHAAN UMUM'
+]);
+
+const ENTITY_TYPES_ = Object.freeze([
+  'COMPANY', 'UNIVERSITY', 'SCHOOL', 'FOUNDATION', 'ASSOCIATION',
+  'COOPERATIVE', 'GOVERNMENT', 'HOSPITAL', 'CLINIC', 'ORGANIZATION', 'OTHER'
 ]);
 
 function onOpen() {
@@ -547,7 +558,7 @@ function processExplicitValidationRows_(ss, sourceSheet, rows, forceEmailRefresh
         result.lastChecked = new Date();
       } else {
         result = validateEmailUsingCompanyMaster_(
-          companySheet, companyIndex, companyName, email, location, false, runId
+          companySheet, companyIndex, companyName, email, location, Boolean(forceEmailRefresh), runId
         );
       }
 
@@ -652,6 +663,13 @@ function validateEmailUsingCompanyMaster_(companySheet, companyIndex, companyNam
   result.ahuStatus = presence.ahu ? (presence.ahu.status || 'NOT_FOUND') : 'NOT_FOUND';
   result.ahuRegisteredName = presence.ahu ? (presence.ahu.registeredName || '') : '';
   result.ahuEvidence = presence.ahu ? (presence.ahu.evidenceUrl || '') : '';
+  result.entityType = presence.entityType || resolveEntityType_(companyName, presence.website.url, location);
+  result.legalEntityName = presence.ahu ? (presence.ahu.legalEntityName || presence.ahu.registeredName || '') : '';
+  result.legalEntityType = presence.ahu ? (presence.ahu.legalEntityType || presence.ahu.legalForm || '') : '';
+  result.legalRelationship = presence.ahu ? (presence.ahu.legalRelationship || '') : '';
+  result.ahuNumber = presence.ahu ? (presence.ahu.ahuNumber || '') : '';
+  result.legalEvidenceSource = presence.ahu ? (presence.ahu.legalEvidenceSource || '') : '';
+  result.legalConfidence = presence.ahu ? Number(presence.ahu.legalConfidence || 0) : 0;
   result.presenceScore = presence.score;
   result.presenceStatus = presence.status;
   result.domainMatch = Boolean(
@@ -996,7 +1014,9 @@ function ensureEvidenceSheet_(ss) {
   paintHeaderGroup_(sheet, map, ['Official Website', 'Website Match', 'Email on Website', 'Website Evidence'], '#548235');
   paintHeaderGroup_(sheet, map, ['LinkedIn Company', 'LinkedIn Match', 'Email on LinkedIn', 'LinkedIn Evidence'], '#2f75b5');
   paintHeaderGroup_(sheet, map, ['Instagram', 'Instagram Match', 'Email on Instagram', 'Instagram Evidence'], '#c2185b');
-  paintHeaderGroup_(sheet, map, ['AHU Status', 'AHU Registered Name', 'AHU Evidence'], '#00838f');
+  paintHeaderGroup_(sheet, map, ['AHU Status', 'AHU Registered Name', 'AHU Evidence',
+    'AHU Number', 'Legal Entity Name', 'Legal Relationship', 'Legal Evidence Source',
+    'Legal Confidence', 'Entity Type'], '#00838f');
   paintHeaderGroup_(sheet, map, ['Other Email Evidence'], '#595959');
 
   sheet.setFrozenRows(1);
@@ -1024,14 +1044,20 @@ function ensureEvidenceSheet_(ss) {
     'AHU Status': 110,
     'AHU Registered Name': 220,
     'AHU Evidence': 130,
-    'Other Email Evidence': 150
+    'Other Email Evidence': 150,
+    'AHU Number': 170,
+    'Legal Entity Name': 220,
+    'Legal Relationship': 180,
+    'Legal Evidence Source': 135,
+    'Legal Confidence': 110,
+    'Entity Type': 120
   };
   Object.keys(widthByHeader).forEach(function (header) {
     if (map[header]) sheet.setColumnWidth(map[header], widthByHeader[header]);
   });
 
   const dataRows = Math.max(sheet.getMaxRows() - 1, 1);
-  ['AHU Registered Name'].forEach(function (header) {
+  ['AHU Registered Name', 'Legal Entity Name', 'Legal Relationship'].forEach(function (header) {
     if (map[header]) sheet.getRange(2, map[header], dataRows, 1).setWrap(true);
   });
 
@@ -1079,6 +1105,13 @@ function ensureCompanyMasterSheet_(ss) {
     'AHU Legal Form': 160,
     'AHU Parent Entity': 230,
     'AHU Evidence': 260,
+    'Entity Type': 125,
+    'Legal Entity Name': 230,
+    'Legal Entity Type': 160,
+    'Legal Relationship': 220,
+    'AHU Number': 170,
+    'Legal Evidence Source': 260,
+    'Legal Confidence': 115,
     'Company Status': 135,
     'Data Source': 140,
     'Validator Version': 120,
@@ -1099,7 +1132,8 @@ function ensureCompanyMasterSheet_(ss) {
       SpreadsheetApp.newDataValidation().requireValueInList(['NO', 'YES'], true).setAllowInvalid(false).build()
     );
   }
-  ['Company Alias', 'AHU Registered Name', 'AHU Parent Entity', 'AHU Evidence', 'Notes'].forEach(function (header) {
+  ['Company Alias', 'AHU Registered Name', 'AHU Parent Entity', 'AHU Evidence',
+    'Legal Entity Name', 'Legal Relationship', 'Legal Evidence Source', 'Notes'].forEach(function (header) {
     if (map[header]) sheet.getRange(2, map[header], dataRows, 1).setWrap(true);
   });
   return sheet;
@@ -1117,7 +1151,7 @@ function invalidateCompanyMasterCacheOnce_(sheet) {
 
   // Tandai cache lama tanpa menghapus atau memindahkan data perusahaan. Baris
   // akan tetap terlihat, tetapi isUsableCompanyCache_ akan memaksa pencarian
-  // ulang sampai upsert v3.3.4 menulis versi baru.
+  // ulang sampai upsert v3.3.5 menulis versi baru.
   if (versionCol && lastRow >= EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW) {
     const values = sheet.getRange(
       EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
@@ -1262,9 +1296,9 @@ function upsertReviewRow_(sheet, index, sourceRow, sourceValues, sourceMap, resu
   const finalStatus = mapFinalStatus_(result.status);
   const evidenceUrl = bestEvidenceSource_(result);
   const evidenceLabel = evidenceDisplayLabel_(result.evidenceType) ||
-    (result.officialWebsite ? 'ðŸŒ Website' :
+    (result.officialWebsite ? '🌐 Website' :
       (result.linkedinUrl ? 'in LinkedIn' :
-        (result.instagramUrl ? 'ðŸ“· Instagram' : (evidenceUrl ? 'ðŸ”Ž Evidence' : ''))));
+        (result.instagramUrl ? '📷 Instagram' : (evidenceUrl ? '🔎 Evidence' : ''))));
   const values = {
     'Source Row': sourceRow,
     'No': sourceMap['No'] ? sourceValues[sourceMap['No'] - 1] : '',
@@ -1290,7 +1324,7 @@ function upsertReviewRow_(sheet, index, sourceRow, sourceValues, sourceMap, resu
   });
 
   if (map['Evidence Type'] && evidenceUrl) {
-    setLabeledHyperlink_(sheet.getRange(outputRow, map['Evidence Type']), evidenceLabel || 'ðŸ”Ž Evidence', evidenceUrl);
+    setLabeledHyperlink_(sheet.getRange(outputRow, map['Evidence Type']), evidenceLabel || '🔎 Evidence', evidenceUrl);
   }
 
   applyReviewStatusColor_(sheet, outputRow, map, finalStatus);
@@ -1310,36 +1344,43 @@ function upsertEvidenceRow_(sheet, index, sourceRow, sourceValues, sourceMap, re
     'Company Name': sourceMap['Company Name'] ? sourceValues[sourceMap['Company Name'] - 1] : '',
     'Email': result.email || '',
     'Final Status': finalStatus,
-    'Official Website': result.officialWebsite ? 'ðŸŒ Website' : '',
+    'Official Website': result.officialWebsite ? '🌐 Website' : '',
     'Website Match': result.websiteMatch || '',
     'Email on Website': evidenceFlag_(result.emailOnWebsite),
-    'Website Evidence': result.websiteEvidence ? 'ðŸ”Ž Evidence' : '',
+    'Website Evidence': result.websiteEvidence ? '🔎 Evidence' : '',
     'LinkedIn Company': result.linkedinUrl ? 'in LinkedIn' : '',
     'LinkedIn Match': result.linkedinMatch || '',
     'Email on LinkedIn': evidenceFlag_(result.emailOnLinkedin),
-    'LinkedIn Evidence': result.linkedinEvidence ? 'ðŸ”Ž Evidence' : '',
-    'Instagram': result.instagramUrl ? 'ðŸ“· Instagram' : '',
+    'LinkedIn Evidence': result.linkedinEvidence ? '🔎 Evidence' : '',
+    'Instagram': result.instagramUrl ? '📷 Instagram' : '',
     'Instagram Match': result.instagramMatch || '',
     'Email on Instagram': evidenceFlag_(result.emailOnInstagram),
-    'Instagram Evidence': result.instagramEvidence ? 'ðŸ”Ž Evidence' : '',
+    'Instagram Evidence': result.instagramEvidence ? '🔎 Evidence' : '',
     'AHU Status': result.ahuStatus || '',
     'AHU Registered Name': result.ahuRegisteredName || '',
-    'AHU Evidence': result.ahuEvidence ? 'ðŸ›ï¸ AHU Evidence' : '',
-    'Other Email Evidence': result.otherEmailEvidence ? 'ðŸ”Ž Other Evidence' : ''
+    'AHU Evidence': result.ahuEvidence ? '🏛️ AHU Evidence' : '',
+    'Other Email Evidence': result.otherEmailEvidence ? '🔎 Other Evidence' : '',
+    'AHU Number': result.ahuNumber || '',
+    'Legal Entity Name': result.legalEntityName || '',
+    'Legal Relationship': result.legalRelationship || '',
+    'Legal Evidence Source': result.legalEvidenceSource ? '🔎 Legal Evidence' : '',
+    'Legal Confidence': Number(result.legalConfidence || 0),
+    'Entity Type': result.entityType || ''
   };
 
   Object.keys(values).forEach(function (header) {
     if (map[header]) sheet.getRange(outputRow, map[header]).setValue(values[header]);
   });
 
-  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Official Website', 'ðŸŒ Website', result.officialWebsite);
-  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Website Evidence', 'ðŸ”Ž Evidence', result.websiteEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Official Website', '🌐 Website', result.officialWebsite);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Website Evidence', '🔎 Evidence', result.websiteEvidence);
   setEvidenceLinkIfPresent_(sheet, outputRow, map, 'LinkedIn Company', 'in LinkedIn', result.linkedinUrl);
-  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'LinkedIn Evidence', 'ðŸ”Ž Evidence', result.linkedinEvidence);
-  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Instagram', 'ðŸ“· Instagram', result.instagramUrl);
-  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Instagram Evidence', 'ðŸ”Ž Evidence', result.instagramEvidence);
-  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'AHU Evidence', 'ðŸ›ï¸ AHU Evidence', result.ahuEvidence);
-  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Other Email Evidence', 'ðŸ”Ž Other Evidence', result.otherEmailEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'LinkedIn Evidence', '🔎 Evidence', result.linkedinEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Instagram', '📷 Instagram', result.instagramUrl);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Instagram Evidence', '🔎 Evidence', result.instagramEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'AHU Evidence', '🏛️ AHU Evidence', result.ahuEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Legal Evidence Source', '🔎 Legal Evidence', result.legalEvidenceSource);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Other Email Evidence', '🔎 Other Evidence', result.otherEmailEvidence);
 
   applyReviewStatusColor_(sheet, outputRow, map, finalStatus);
   applyEvidenceCellColors_(sheet, outputRow, map, values);
@@ -1359,7 +1400,7 @@ function setLabeledHyperlink_(cell, label, url) {
   }
   try {
     const rich = SpreadsheetApp.newRichTextValue()
-      .setText(label || 'ðŸ”Ž Evidence')
+      .setText(label || '🔎 Evidence')
       .setLinkUrl(cleanUrl)
       .build();
     cell.setRichTextValue(rich).setHorizontalAlignment('center');
@@ -1370,12 +1411,12 @@ function setLabeledHyperlink_(cell, label, url) {
 
 function evidenceDisplayLabel_(evidenceType) {
   const type = cleanText_(evidenceType).toUpperCase();
-  if (type === 'OFFICIAL_WEBSITE') return 'ðŸŒ Website';
+  if (type === 'OFFICIAL_WEBSITE') return '🌐 Website';
   if (type === 'OFFICIAL_LINKEDIN' || type === 'LINKEDIN_SOURCE') return 'in LinkedIn';
-  if (type === 'OFFICIAL_INSTAGRAM' || type === 'INSTAGRAM_SOURCE') return 'ðŸ“· Instagram';
-  if (type === 'OTHER_OFFICIAL_SOCIAL') return 'ðŸ‘¥ Social';
-  if (type === 'THIRD_PARTY_JOB_POST') return 'ðŸ’¼ Job Post';
-  if (type) return 'ðŸ”Ž Evidence';
+  if (type === 'OFFICIAL_INSTAGRAM' || type === 'INSTAGRAM_SOURCE') return '📷 Instagram';
+  if (type === 'OTHER_OFFICIAL_SOCIAL') return '👥 Social';
+  if (type === 'THIRD_PARTY_JOB_POST') return '💼 Job Post';
+  if (type) return '🔎 Evidence';
   return '';
 }
 
@@ -1472,7 +1513,7 @@ function companyProofLabel_(result) {
   if (result.presenceStatus === 'VERIFIED_STRONG') strength = 'KUAT';
   else if (result.presenceStatus === 'FOUND') strength = 'ADA';
   else if (result.presenceStatus === 'REVIEW_REQUIRED') strength = 'PERLU CEK';
-  return channels.length ? strength + ' â€” ' + channels.join(' + ') : strength;
+  return channels.length ? strength + ' — ' + channels.join(' + ') : strength;
 }
 
 function bestEvidenceSource_(result) {
@@ -1529,6 +1570,13 @@ function loadCompanyMasterIndex_(sheet) {
       ahuLegalForm: readMapped_(row, map, 'AHU Legal Form') || '',
       ahuParentEntity: readMapped_(row, map, 'AHU Parent Entity') || '',
       ahuEvidence: readMapped_(row, map, 'AHU Evidence') || '',
+      entityType: readMapped_(row, map, 'Entity Type') || '',
+      legalEntityName: readMapped_(row, map, 'Legal Entity Name') || '',
+      legalEntityType: readMapped_(row, map, 'Legal Entity Type') || '',
+      legalRelationship: readMapped_(row, map, 'Legal Relationship') || '',
+      ahuNumber: readMapped_(row, map, 'AHU Number') || '',
+      legalEvidenceSource: readMapped_(row, map, 'Legal Evidence Source') || '',
+      legalConfidence: readMapped_(row, map, 'Legal Confidence') || '',
       status: readMapped_(row, map, 'Company Status') || '',
       dataSource: readMapped_(row, map, 'Data Source') || '',
       validatorVersion: readMapped_(row, map, 'Validator Version') || '',
@@ -1554,9 +1602,17 @@ function upsertCompanyMaster_(sheet, index, key, companyName, location, presence
   const strongWebsite = presence.website && presence.website.status === 'MATCH';
   const strongLinkedIn = presence.linkedin && /MATCH|OFFICIAL_LINK/.test(presence.linkedin.status || '');
   const strongInstagram = presence.instagram && /MATCH|OFFICIAL_LINK/.test(presence.instagram.status || '');
-  const ahu = presence.ahu || { status: 'NOT_FOUND', registeredName: '', evidenceUrl: '' };
+  const ahu = presence.ahu || {
+    status: 'NOT_FOUND', registeredName: '', legalEntityName: '', legalEntityType: '',
+    legalRelationship: '', ahuNumber: '', evidenceUrl: '', legalEvidenceSource: '', legalConfidence: 0
+  };
   const ahuEvidence = isOfficialAhuEvidenceUrl_(ahu.evidenceUrl) ? ahu.evidenceUrl : '';
-  const ahuStatus = ahuEvidence ? (ahu.status || 'NOT_FOUND') : 'NOT_FOUND';
+  const legalEvidenceSource = isLegalEvidenceSourceUrl_(ahu.legalEvidenceSource || ahu.source, companyName, presence.website && presence.website.domain)
+    ? (ahu.legalEvidenceSource || ahu.source) : '';
+  const ahuStatus = ['DIRECT_MATCH', 'PARENT_ENTITY_MATCH', 'REVIEW', 'MANUAL_AHU_CHECK'].indexOf(
+    cleanText_(ahu.status).toUpperCase()
+  ) !== -1 && (ahuEvidence || legalEvidenceSource)
+    ? cleanText_(ahu.status).toUpperCase() : (ahu.status === 'NOT_APPLICABLE' ? 'NOT_APPLICABLE' : 'NOT_FOUND');
   const identity = buildCompanyIdentity_(companyName);
   const companyAlias = cleanText_(presence.companyAlias || identity.aliases.join(' | '));
 
@@ -1578,6 +1634,13 @@ function upsertCompanyMaster_(sheet, index, key, companyName, location, presence
     'AHU Legal Form': ahu.legalForm || '',
     'AHU Parent Entity': ahu.parentEntity || '',
     'AHU Evidence': ahuEvidence,
+    'Entity Type': presence.entityType || resolveEntityType_(companyName, presence.website && presence.website.url, location),
+    'Legal Entity Name': ahu.legalEntityName || ahu.registeredName || '',
+    'Legal Entity Type': ahu.legalEntityType || ahu.legalForm || '',
+    'Legal Relationship': ahu.legalRelationship || '',
+    'AHU Number': ahu.ahuNumber || '',
+    'Legal Evidence Source': legalEvidenceSource,
+    'Legal Confidence': Number(ahu.legalConfidence || 0),
     'Company Status': friendlyCompanyStatus_(presence.status),
     'Data Source': dataSource || 'OPENAI WEB SEARCH',
     'Validator Version': EMAIL_VALIDATOR_CONFIG.VERSION,
@@ -1609,6 +1672,13 @@ function upsertCompanyMaster_(sheet, index, key, companyName, location, presence
     ahuLegalForm: values['AHU Legal Form'],
     ahuParentEntity: values['AHU Parent Entity'],
     ahuEvidence: values['AHU Evidence'],
+    entityType: values['Entity Type'],
+    legalEntityName: values['Legal Entity Name'],
+    legalEntityType: values['Legal Entity Type'],
+    legalRelationship: values['Legal Relationship'],
+    ahuNumber: values['AHU Number'],
+    legalEvidenceSource: values['Legal Evidence Source'],
+    legalConfidence: values['Legal Confidence'],
     status: values['Company Status'],
     dataSource: values['Data Source'],
     validatorVersion: values['Validator Version'],
@@ -1647,10 +1717,13 @@ function isUsableCompanyCache_(item) {
 
   if (!isCompatibleCompanyMasterCacheVersion_(item.validatorVersion)) return false;
 
-  // Cache provider lama dan Company Master sebelum AHU engine dianggap stale satu kali.
+  // Cache provider lama dan Company Master sebelum resolver legal baru dianggap stale satu kali.
   if (/BRAVE/.test(cleanText_(item.dataSource).toUpperCase())) return false;
   if (!cleanText_(item.ahuStatus)) return false;
-  if (/^(MATCH|REVIEW)$/.test(cleanText_(item.ahuStatus).toUpperCase()) &&
+  const ahuStatus = cleanText_(item.ahuStatus).toUpperCase();
+  if (['DIRECT_MATCH', 'PARENT_ENTITY_MATCH', 'REVIEW', 'MANUAL_AHU_CHECK', 'NOT_FOUND', 'NOT_APPLICABLE'].indexOf(ahuStatus) === -1) return false;
+  if (/^(DIRECT_MATCH|PARENT_ENTITY_MATCH|REVIEW|MANUAL_AHU_CHECK)$/.test(ahuStatus) &&
+      !isLegalEvidenceSourceUrl_(item.legalEvidenceSource, item.companyName, item.domain) &&
       !isOfficialAhuEvidenceUrl_(item.ahuEvidence)) return false;
 
   if (!item.lastChecked || !item.status) return false;
@@ -1664,9 +1737,13 @@ function companyItemToPresence_(item) {
   const status = technicalCompanyStatus_(item.status);
   const websiteStatus = item.website && item.domain ? 'MATCH' : 'NOT_FOUND';
   const ahuEvidence = isOfficialAhuEvidenceUrl_(item.ahuEvidence) ? item.ahuEvidence : '';
+  const legalEvidenceSource = isLegalEvidenceSourceUrl_(item.legalEvidenceSource, item.companyName, item.domain)
+    ? item.legalEvidenceSource : '';
   const ahuStatus = ahuEvidence
     ? (cleanText_(item.ahuStatus).toUpperCase() || 'NOT_FOUND')
-    : 'NOT_FOUND';
+    : (cleanText_(item.ahuStatus).toUpperCase() === 'NOT_APPLICABLE' ? 'NOT_APPLICABLE' :
+      (legalEvidenceSource
+        ? cleanText_(item.ahuStatus).toUpperCase() : 'NOT_FOUND'));
   return {
     website: {
       url: item.website || '', website: item.website || '', domain: item.domain || '',
@@ -1684,11 +1761,19 @@ function companyItemToPresence_(item) {
     ahu: {
       status: ahuStatus,
       registeredName: item.ahuRegisteredName || '',
+      legalEntityName: item.legalEntityName || item.ahuRegisteredName || '',
+      legalEntityType: item.legalEntityType || item.ahuLegalForm || '',
       legalForm: item.ahuLegalForm || '',
       parentEntity: item.ahuParentEntity || '',
+      legalRelationship: item.legalRelationship || '',
+      ahuNumber: item.ahuNumber || '',
       evidenceUrl: ahuEvidence,
-      score: ahuStatus === 'MATCH' ? 25 : (ahuStatus === 'REVIEW' ? 6 : 0)
+      legalEvidenceSource: legalEvidenceSource,
+      legalConfidence: Number(item.legalConfidence || 0),
+      score: /^(DIRECT_MATCH|PARENT_ENTITY_MATCH)$/.test(ahuStatus) ? 25 :
+        (/^(REVIEW|MANUAL_AHU_CHECK)$/.test(ahuStatus) ? 6 : 0)
     },
+    entityType: item.entityType || resolveEntityType_(item.companyName, item.website, item.location),
     companyAlias: item.companyAlias || '',
     score: status === 'VERIFIED_STRONG' ? 80 : (status === 'FOUND' ? 50 : (status === 'REVIEW_REQUIRED' ? 20 : 0)),
     status: status
@@ -1756,6 +1841,13 @@ function upsertRawRow_(sheet, index, sourceRow, sourceValues, sourceMap, result)
     'AHU Status': result.ahuStatus || '',
     'AHU Registered Name': result.ahuRegisteredName || '',
     'AHU Evidence': result.ahuEvidence || '',
+    'Entity Type': result.entityType || '',
+    'Legal Entity Name': result.legalEntityName || '',
+    'Legal Entity Type': result.legalEntityType || '',
+    'Legal Relationship': result.legalRelationship || '',
+    'AHU Number': result.ahuNumber || '',
+    'Legal Evidence Source': result.legalEvidenceSource || '',
+    'Legal Confidence': Number(result.legalConfidence || 0),
     'Company Presence Score': Number(result.presenceScore || 0),
     'Company Presence Status': result.presenceStatus || '',
     'Official Domain': result.officialDomain || '',
@@ -1810,6 +1902,13 @@ function rawRowToResult_(row, map) {
     ahuStatus: cleanText_(readMapped_(row, map, 'AHU Status')),
     ahuRegisteredName: cleanText_(readMapped_(row, map, 'AHU Registered Name')),
     ahuEvidence: cleanText_(readMapped_(row, map, 'AHU Evidence')),
+    entityType: cleanText_(readMapped_(row, map, 'Entity Type')),
+    legalEntityName: cleanText_(readMapped_(row, map, 'Legal Entity Name')),
+    legalEntityType: cleanText_(readMapped_(row, map, 'Legal Entity Type')),
+    legalRelationship: cleanText_(readMapped_(row, map, 'Legal Relationship')),
+    ahuNumber: cleanText_(readMapped_(row, map, 'AHU Number')),
+    legalEvidenceSource: cleanText_(readMapped_(row, map, 'Legal Evidence Source')),
+    legalConfidence: Number(readMapped_(row, map, 'Legal Confidence') || 0),
     presenceScore: Number(readMapped_(row, map, 'Company Presence Score') || 0),
     presenceStatus: cleanText_(readMapped_(row, map, 'Company Presence Status')),
     officialDomain: cleanText_(readMapped_(row, map, 'Official Domain')),
@@ -1852,14 +1951,17 @@ function resultToPresence_(result) {
   const linkedStrong = Boolean(result.linkedinUrl && /MATCH|OFFICIAL_LINK/.test(result.linkedinMatch || 'MATCH'));
   const instagramStrong = Boolean(result.instagramUrl && /MATCH|OFFICIAL_LINK/.test(result.instagramMatch || 'MATCH'));
   const ahuEvidence = isOfficialAhuEvidenceUrl_(result.ahuEvidence) ? result.ahuEvidence : '';
-  const ahuStatus = ahuEvidence ? (cleanText_(result.ahuStatus).toUpperCase() || 'NOT_FOUND') : 'NOT_FOUND';
-  const ahuStrong = ahuStatus === 'MATCH';
+  const legalEvidenceSource = isLegalEvidenceSourceUrl_(result.legalEvidenceSource, result.companyName, result.officialDomain)
+    ? result.legalEvidenceSource : '';
+  const ahuStatus = ahuEvidence || legalEvidenceSource
+    ? (cleanText_(result.ahuStatus).toUpperCase() || 'NOT_FOUND') : 'NOT_FOUND';
+  const ahuStrong = /^(DIRECT_MATCH|PARENT_ENTITY_MATCH)$/.test(ahuStatus);
   const strongCount = (websiteValid ? 1 : 0) + (linkedStrong ? 1 : 0) +
     (instagramStrong ? 1 : 0) + (ahuStrong ? 1 : 0);
   var status = 'NOT_FOUND';
   if (strongCount >= 2) status = 'VERIFIED_STRONG';
   else if (strongCount === 1) status = 'FOUND';
-  else if (result.presenceStatus === 'REVIEW_REQUIRED' || ahuStatus === 'REVIEW') status = 'REVIEW_REQUIRED';
+  else if (result.presenceStatus === 'REVIEW_REQUIRED' || /^(REVIEW|MANUAL_AHU_CHECK)$/.test(ahuStatus)) status = 'REVIEW_REQUIRED';
 
   return {
     website: {
@@ -1883,12 +1985,19 @@ function resultToPresence_(result) {
     ahu: {
       status: ahuStatus,
       registeredName: result.ahuRegisteredName || '',
-      legalForm: extractAhuLegalForm_(result.ahuRegisteredName || ''),
-      parentEntity: '',
+      legalEntityName: result.legalEntityName || result.ahuRegisteredName || '',
+      legalEntityType: result.legalEntityType || extractAhuLegalForm_(result.ahuRegisteredName || ''),
+      legalForm: result.legalEntityType || extractAhuLegalForm_(result.ahuRegisteredName || ''),
+      parentEntity: result.legalRelationship === 'PARENT_ENTITY' ? (result.legalEntityName || '') : '',
+      legalRelationship: result.legalRelationship || '',
+      ahuNumber: result.ahuNumber || '',
       evidenceUrl: ahuEvidence,
-      score: ahuStrong ? 25 : (ahuStatus === 'REVIEW' ? 6 : 0)
+      legalEvidenceSource: legalEvidenceSource,
+      legalConfidence: Number(result.legalConfidence || 0),
+      score: ahuStrong ? 25 : (/^(REVIEW|MANUAL_AHU_CHECK)$/.test(ahuStatus) ? 6 : 0)
     },
-    score: strongCount >= 2 ? 80 : (strongCount === 1 ? 50 : (ahuStatus === 'REVIEW' ? 20 : 0)),
+    entityType: result.entityType || resolveEntityType_(result.companyName, result.officialWebsite, ''),
+    score: strongCount >= 2 ? 80 : (strongCount === 1 ? 50 : (/^(REVIEW|MANUAL_AHU_CHECK)$/.test(ahuStatus) ? 20 : 0)),
     status: status
   };
 }
@@ -1902,6 +2011,10 @@ function copyRawResult_(cached) {
     instagramUrl: cached.instagramUrl || '', instagramMatch: cached.instagramMatch || '',
     ahuStatus: cached.ahuStatus || '', ahuRegisteredName: cached.ahuRegisteredName || '',
     ahuEvidence: cached.ahuEvidence || '',
+    entityType: cached.entityType || '', legalEntityName: cached.legalEntityName || '',
+    legalEntityType: cached.legalEntityType || '', legalRelationship: cached.legalRelationship || '',
+    ahuNumber: cached.ahuNumber || '', legalEvidenceSource: cached.legalEvidenceSource || '',
+    legalConfidence: Number(cached.legalConfidence || 0),
     presenceScore: Number(cached.presenceScore || 0), presenceStatus: cached.presenceStatus || '',
     officialDomain: cached.officialDomain || '', domainMatch: cached.domainMatch,
     exactEmailFound: cached.exactEmailFound, companyMatched: cached.companyMatched,
@@ -1942,6 +2055,8 @@ function emptyValidationResult_(email) {
     officialWebsite: '', websiteMatch: '', linkedinUrl: '', linkedinMatch: '',
     instagramUrl: '', instagramMatch: '',
     ahuStatus: '', ahuRegisteredName: '', ahuEvidence: '',
+    entityType: '', legalEntityName: '', legalEntityType: '', legalRelationship: '',
+    ahuNumber: '', legalEvidenceSource: '', legalConfidence: 0,
     presenceScore: 0, presenceStatus: '',
     officialDomain: '', domainMatch: null, exactEmailFound: null,
     companyMatched: null, otherCompanySuspected: null,
@@ -2338,6 +2453,33 @@ function canonicalSourceUrl_(url) {
     .toLowerCase();
 }
 
+function resolveEntityType_(companyName, officialWebsite, location) {
+  const identityName = companyName ? buildCompanyIdentity_(companyName).canonicalName : '';
+  const text = normalizeText_([companyName, identityName, officialWebsite, location].join(' '));
+  if (!text) return 'OTHER';
+  if (/\b(kementerian|kemendik|dinas|pemerintah|pemprov|pemkab|pemkot|kelurahan|kecamatan|desa|badan\s+usaha\s+milik\s+negara|bumn|bumn daerah|bumd)\b/.test(text)) {
+    return 'GOVERNMENT';
+  }
+  if (/\b(rumah\s+sakit|hospital|rsud|rs\s+umum|rs\s+khusus)\b/.test(text)) return 'HOSPITAL';
+  if (/\b(klinik|clinic|puskesmas|praktek\s+dokter)\b/.test(text)) return 'CLINIC';
+  if (/\b(universitas|university|institut|institute|akademi|college|politeknik|polytechnic)\b/.test(text)) {
+    return 'UNIVERSITY';
+  }
+  if (/\b(sekolah|school|sma|smk|smp|sd|madrasah|pesantren|boarding\s+school)\b/.test(text)) return 'SCHOOL';
+  if (/\b(yayasan|foundation)\b/.test(text)) return 'FOUNDATION';
+  if (/\b(perkumpulan|asosiasi|association|persyarikatan|serikat)\b/.test(text)) return 'ASSOCIATION';
+  if (/\b(koperasi|cooperative)\b/.test(text)) return 'COOPERATIVE';
+  if (/\b(organisasi|organization|lembaga|forum|komunitas|community)\b/.test(text)) return 'ORGANIZATION';
+  if (/\b(pt|cv|tbk|perusahaan|company|corporation|corp|perseroan|perum|bumn|bumd)\b/.test(text)) return 'COMPANY';
+  if (/\.ac\.id\b/.test(text)) return 'UNIVERSITY';
+  if (/\.sch\.id\b/.test(text)) return 'SCHOOL';
+  return 'OTHER';
+}
+
+function isEducationalEntityType_(entityType) {
+  return /^(UNIVERSITY|SCHOOL)$/.test(cleanText_(entityType).toUpperCase());
+}
+
 function buildCompanyIdentity_(companyName) {
   const rawName = cleanText_(companyName);
   const normalizedName = normalizeText_(rawName);
@@ -2462,9 +2604,32 @@ function buildAhuSearchQuery_(companyName, location, fallback) {
   ].filter(Boolean).join(' ');
 }
 
+function buildLegalEntitySearchQuery_(companyName, location, entityType, fallback) {
+  const identity = buildCompanyIdentity_(companyName);
+  const names = (fallback ? identity.aliases : [companyName]).slice(0, 8).map(function (alias) {
+    return '"' + sanitizeSearchPhrase_(alias) + '"';
+  });
+  const parents = fallback ? getAhuParentEntities_(companyName).slice(0, 8).map(function (parent) {
+    return '"' + sanitizeSearchPhrase_(parent) + '"';
+  }) : [];
+  const legalTerms = [
+    '"badan hukum"', '"badan penyelenggara"', 'yayasan', 'perkumpulan',
+    'persyarikatan', 'organisasi', 'koperasi', '"keputusan menteri"', 'AHU'
+  ];
+  const sourceHints = fallback ? ['site:ahu.go.id', 'site:go.id', 'site:ac.id', 'site:or.id'] : ['site:ahu.go.id'];
+  return [
+    '(' + sourceHints.join(' OR ') + ')',
+    names.length ? '(' + names.join(' OR ') + ')' : '',
+    cleanText_(location),
+    parents.length ? '(' + parents.join(' OR ') + ')' : '',
+    '(' + legalTerms.join(' OR ') + ')',
+    cleanText_(entityType)
+  ].filter(Boolean).join(' ');
+}
+
 function getAhuParentEntities_(companyName) {
   const identity = buildCompanyIdentity_(companyName);
-  const normalized = normalizeText_(companyName);
+  const normalized = normalizeText_([companyName, identity.canonicalName].join(' '));
   const parents = [];
   if (normalized.indexOf('muhammadiyah') !== -1) {
     parents.push('Persyarikatan Muhammadiyah', 'Pimpinan Pusat Muhammadiyah');
@@ -2490,6 +2655,7 @@ function getAhuParentEntities_(companyName) {
 
 function findCompanyPresence_(companyName, location, runId) {
   const locationText = cleanText_(location);
+  const entityType = resolveEntityType_(companyName, '', locationText);
 
   const websiteResults = openAIWebSearch_(
     buildCompanySearchQuery_(companyName, locationText, 'official website'), runId
@@ -2504,8 +2670,11 @@ function findCompanyPresence_(companyName, location, runId) {
   if (linkedProfiles.linkedin) {
     linkedin = { url: linkedProfiles.linkedin, status: 'OFFICIAL_LINK', score: 100, source: website.url };
   } else {
+    const linkedinSiteQuery = isEducationalEntityType_(entityType)
+      ? '(site:linkedin.com/school OR site:linkedin.com/company)'
+      : 'site:linkedin.com/company';
     const linkedinResults = openAIWebSearch_([
-      '(site:linkedin.com/company OR site:linkedin.com/school)',
+      linkedinSiteQuery,
       buildCompanySearchQuery_(companyName, locationText, ''),
       'official profile'
     ].filter(Boolean).join(' '), runId);
@@ -2523,16 +2692,10 @@ function findCompanyPresence_(companyName, location, runId) {
     instagram = inferSocialProfile_(instagramResults, companyName, locationText, 'INSTAGRAM');
   }
 
-  // AHU bersifat company-level dan disimpan ke Company Master, jadi query ini tidak diulang
-  // untuk perusahaan yang cache-nya masih valid. Jika nama operasional tidak ditemukan,
-  // query kedua memakai alias, lokasi, dan kandidat badan hukum induk.
-  const ahuResults = openAIWebSearch_(buildAhuSearchQuery_(companyName, locationText, false), runId);
-  var ahu = inferAhuPresence_(ahuResults, companyName, locationText);
-  if (ahu.status === 'NOT_FOUND') {
-    const fallbackResults = openAIWebSearch_(buildAhuSearchQuery_(companyName, locationText, true), runId);
-    ahu = inferAhuPresence_(fallbackResults, companyName, locationText);
-    ahu.fallbackUsed = true;
-  }
+  // Resolver legal dimulai dari nama operasional di AHU. Jika belum cukup,
+  // fallback memperluas alias, lokasi, dan badan hukum induk. Semua URL tetap
+  // berasal dari source/citation Web Search; tidak ada URL yang dibuat model.
+  const ahu = resolveLegalEntityPresence_(companyName, locationText, entityType, website.domain, runId);
 
   var score = 0;
   if (website.status === 'MATCH') score += 45;
@@ -2546,14 +2709,14 @@ function findCompanyPresence_(companyName, location, runId) {
   else if (instagram.status === 'MATCH') score += 25;
   else if (instagram.status === 'REVIEW') score += 8;
 
-  if (ahu.status === 'MATCH') score += 25;
-  else if (ahu.status === 'REVIEW') score += 6;
+  if (/^(DIRECT_MATCH|PARENT_ENTITY_MATCH)$/.test(ahu.status)) score += 25;
+  else if (/^(REVIEW|MANUAL_AHU_CHECK)$/.test(ahu.status)) score += 6;
 
   score = Math.min(100, score);
 
   const strongCount = [website, linkedin, instagram].filter(function (item) {
     return item.status === 'MATCH' || item.status === 'OFFICIAL_LINK';
-  }).length + (ahu.status === 'MATCH' ? 1 : 0);
+  }).length + (/^(DIRECT_MATCH|PARENT_ENTITY_MATCH)$/.test(ahu.status) ? 1 : 0);
 
   var presenceStatus = 'NOT_FOUND';
   if (strongCount >= 2 || (website.status === 'MATCH' && score >= 65)) {
@@ -2569,6 +2732,7 @@ function findCompanyPresence_(companyName, location, runId) {
     linkedin: linkedin,
     instagram: instagram,
     ahu: ahu,
+    entityType: entityType,
     companyAlias: buildCompanyIdentity_(companyName).aliases.join(' | '),
     score: score,
     status: presenceStatus
@@ -2576,17 +2740,65 @@ function findCompanyPresence_(companyName, location, runId) {
 }
 
 
+function resolveLegalEntityPresence_(companyName, location, entityType, officialDomain, runId) {
+  if (cleanText_(entityType).toUpperCase() === 'GOVERNMENT') {
+    return emptyLegalPresence_('NOT_APPLICABLE');
+  }
+
+  const initialResults = openAIWebSearch_(
+    buildAhuSearchQuery_(companyName, location, false), runId
+  );
+  var legal = inferLegalEntityPresence_(initialResults, companyName, location, entityType, officialDomain);
+  if (/^(DIRECT_MATCH|PARENT_ENTITY_MATCH)$/.test(legal.status)) return legal;
+
+  const fallbackResults = openAIWebSearch_(
+    buildLegalEntitySearchQuery_(companyName, location, entityType, true), runId
+  );
+  const merged = mergeSearchResults_(initialResults, fallbackResults);
+  legal = inferLegalEntityPresence_(merged, companyName, location, entityType, officialDomain);
+  legal.fallbackUsed = true;
+  return legal;
+}
+
+function mergeSearchResults_(first, second) {
+  const merged = [];
+  const seen = {};
+  (first || []).concat(second || []).forEach(function (item) {
+    const key = canonicalSourceUrl_(item && item.url);
+    if (!key || seen[key]) return;
+    seen[key] = true;
+    merged.push(item);
+  });
+  return merged;
+}
+
 function inferAhuPresence_(results, companyName, location) {
+  // Compatibility wrapper: fungsi bernama AHU hanya boleh menganggap URL
+  // ahu.go.id sebagai bukti AHU. Resolver legal baru memakai fungsi di bawah
+  // ini untuk sumber pemerintah/official lain tanpa mengisi AHU Evidence.
+  const ahuResults = (results || []).filter(function (item) {
+    return isOfficialAhuEvidenceUrl_(item && item.url);
+  });
+  return inferLegalEntityPresence_(ahuResults, companyName, location,
+    resolveEntityType_(companyName, '', location), '');
+}
+
+function inferLegalEntityPresence_(results, companyName, location, entityType, officialDomain) {
+  const normalizedEntityType = cleanText_(entityType).toUpperCase() || resolveEntityType_(companyName, '', location);
+  if (normalizedEntityType === 'GOVERNMENT') return emptyLegalPresence_('NOT_APPLICABLE');
+
   const identity = buildCompanyIdentity_(companyName);
   const locationTokens = tokenizeLocation_(location);
   const parentEntities = getAhuParentEntities_(companyName);
   const candidates = [];
+  const manualCandidates = [];
   const seen = {};
 
-  results.forEach(function (item, index) {
+  (results || []).forEach(function (item, index) {
     const url = cleanText_(item && item.url);
     const domain = getDomain_(url);
-    if (!url || !isOfficialAhuDomain_(domain) || !isOfficialAhuEvidenceUrl_(url)) return;
+    const isAhu = isOfficialAhuEvidenceUrl_(url);
+    if (!url || !domain || !isLegalEvidenceSourceUrl_(url, companyName, officialDomain)) return;
 
     const canonical = canonicalSourceUrl_(url);
     if (!canonical || seen[canonical]) return;
@@ -2596,66 +2808,102 @@ function inferAhuPresence_(results, companyName, location) {
     const rawDescription = cleanText_(item.description || '');
     const snippets = Array.isArray(item.extra_snippets) ? item.extra_snippets.join(' ') : '';
     const evidenceText = cleanText_([rawTitle, rawDescription, snippets].join(' '));
-    const normalizedEvidence = normalizeText_(evidenceText);
-
-    const identityMatch = getCompanyIdentityMatch_(identity, evidenceText, domain);
+    const normalizedEvidence = normalizeText_([evidenceText, url].join(' '));
+    const identityMatch = getCompanyIdentityMatch_(identity, [evidenceText, url].join(' '), domain);
     const parentEntity = parentEntities.find(function (parent) {
       return containsNormalizedPhrase_(normalizedEvidence, normalizeText_(parent));
     }) || '';
     const locationMatches = countTokenMatches_(locationTokens, normalizedEvidence);
     const legalForm = extractAhuLegalForm_(evidenceText);
-    const entitySpecificSignal = Boolean(legalForm) ||
-      /\b(sertifikat|terdaftar|berkedudukan|profil|nomor\s+ahu|daftar\s+perseroan|badan\s+hukum)\b/i
+    const legalSignal = Boolean(legalForm) ||
+      /\b(sertifikat|terdaftar|berkedudukan|profil|nomor\s+ahu|daftar\s+perseroan|badan\s+hukum|badan\s+penyelenggara|penyelenggara|didirikan|akta|keputusan\s+menteri|surat\s+keputusan|sk\s+menteri)\b/i
         .test(evidenceText);
-
-    // Nama operasional boleh lolos langsung. Untuk fallback alias, wajib ada
-    // penguat lokasi atau badan hukum induk agar alias pendek tidak menjadi
-    // false-positive.
+    const manualSignal = isAhu && /captcha|verifikasi|akses\s+ditolak|forbidden|login|detail\s+(?:tidak|belum)|tidak\s+ditemukan|no\s+result|hasil\s+pencarian/i.test(evidenceText);
+    const supportedAlias = identityMatch.matched &&
+      (!identityMatch.aliasMatched || identityMatch.fullNameSupported || parentEntity || locationMatches > 0);
     if (!identityMatch.matched && !parentEntity) return;
-    if (!identityMatch.fullNameSupported && !parentEntity && !locationMatches) return;
+    if (!supportedAlias && !parentEntity) return;
 
-    var score = identityMatch.tokenMatches * 16 + Math.max(0, 8 - index);
-    if (identityMatch.fullNameSupported) score += 30;
-    if (identityMatch.aliasMatched) score += 12;
-    if (identityMatch.matchedDomainStem) score += 16;
-    if (parentEntity) score += 22;
-    if (legalForm) score += 18;
-    if (entitySpecificSignal) score += 18;
-    if (locationMatches) score += Math.min(10, locationMatches * 4);
+    var score = identityMatch.tokenMatches * 15 + Math.max(0, 8 - index);
+    if (identityMatch.fullNameSupported) score += 32;
+    if (identityMatch.aliasMatched) score += 8;
+    if (identityMatch.matchedDomainStem) score += 12;
+    if (parentEntity) score += 26;
+    if (legalForm) score += 22;
+    if (legalSignal) score += 16;
+    if (locationMatches) score += Math.min(12, locationMatches * 4);
+    if (isAhu) score += 10;
+    else if (sameRegistrableDomain_(domain, officialDomain)) score += 12;
+    else if (/\.go\.id$|\.gov\.id$/.test(domain)) score += 8;
 
     const registeredName = extractAhuRegisteredName_(evidenceText, companyName);
-    const strongIdentity = identityMatch.fullNameSupported ||
-      (identityMatch.matched && (parentEntity || locationMatches)) ||
-      Boolean(parentEntity && locationMatches);
-    const status = strongIdentity && entitySpecificSignal && score >= 50
-      ? 'MATCH'
-      : (score >= 35 ? 'REVIEW' : 'NOT_FOUND');
+    const legalEntityName = parentEntity && legalSignal
+      ? parentEntity : (legalForm && registeredName ? registeredName : '');
+    const relationship = parentEntity || /\b(badan\s+penyelenggara|penyelenggara|naungan|berada\s+di\s+bawah|didirikan\s+oleh|milik|persyarikatan)\b/i.test(evidenceText)
+      ? 'PARENT_ENTITY' : (legalSignal ? 'DIRECT_ENTITY' : '');
+    const strongDirect = identityMatch.fullNameSupported && !parentEntity &&
+      relationship !== 'PARENT_ENTITY' && legalSignal && score >= 55;
+    const strongParent = Boolean(parentEntity || relationship === 'PARENT_ENTITY') &&
+      (identityMatch.matched || locationMatches > 0) && legalSignal && score >= 55;
+    var status = strongDirect ? 'DIRECT_MATCH' : (strongParent ? 'PARENT_ENTITY_MATCH' : 'REVIEW');
+    if (manualSignal && !strongDirect && !strongParent) status = 'MANUAL_AHU_CHECK';
+    if (status === 'REVIEW' && score < 30 && !manualSignal) return;
 
-    if (status === 'NOT_FOUND') return;
-    candidates.push({
+    const candidate = {
       status: status,
       registeredName: registeredName,
+      legalEntityName: legalEntityName,
       legalForm: legalForm,
+      legalEntityType: legalForm || inferLegalEntityType_(legalEntityName, normalizedEntityType),
       parentEntity: parentEntity,
-      evidenceUrl: isOfficialAhuEvidenceUrl_(url) ? url : '',
+      legalRelationship: relationship,
+      ahuNumber: extractAhuNumber_(evidenceText),
+      evidenceUrl: isAhu ? url : '',
+      ahuEvidence: isAhu ? url : '',
+      legalEvidenceSource: url,
+      legalConfidence: status === 'DIRECT_MATCH' ? Math.min(100, Math.max(75, score))
+        : (status === 'PARENT_ENTITY_MATCH' ? Math.min(95, Math.max(65, score))
+          : (status === 'MANUAL_AHU_CHECK' ? 35 : Math.min(70, Math.max(40, score)))),
       score: Math.min(100, score),
-      source: url
-    });
+      source: url,
+      fallbackUsed: false
+    };
+    if (status === 'MANUAL_AHU_CHECK') manualCandidates.push(candidate);
+    else candidates.push(candidate);
   });
 
+  const rank = {
+    DIRECT_MATCH: 5, PARENT_ENTITY_MATCH: 4, REVIEW: 3,
+    MANUAL_AHU_CHECK: 2, NOT_FOUND: 1, NOT_APPLICABLE: 0
+  };
   candidates.sort(function (a, b) {
-    if (a.status !== b.status) return a.status === 'MATCH' ? -1 : 1;
-    return b.score - a.score;
+    return (rank[b.status] - rank[a.status]) || (b.score - a.score);
   });
+  if (candidates.length) return candidates[0];
+  if (manualCandidates.length) {
+    manualCandidates.sort(function (a, b) { return b.score - a.score; });
+    return manualCandidates[0];
+  }
+  return emptyLegalPresence_('NOT_FOUND');
+}
 
-  return candidates.length ? candidates[0] : {
-    status: 'NOT_FOUND',
+function emptyLegalPresence_(status) {
+  return {
+    status: status || 'NOT_FOUND',
     registeredName: '',
+    legalEntityName: '',
     legalForm: '',
+    legalEntityType: '',
     parentEntity: '',
+    legalRelationship: '',
+    ahuNumber: '',
     evidenceUrl: '',
+    ahuEvidence: '',
+    legalEvidenceSource: '',
+    legalConfidence: 0,
     score: 0,
-    source: ''
+    source: '',
+    fallbackUsed: false
   };
 }
 
@@ -2666,6 +2914,38 @@ function isOfficialAhuDomain_(domain) {
 
 function isOfficialAhuEvidenceUrl_(url) {
   return Boolean(cleanText_(url) && isOfficialAhuDomain_(getDomain_(url)));
+}
+
+function isLegalEvidenceSourceUrl_(url, companyName, officialDomain) {
+  const value = cleanText_(url);
+  const domain = getDomain_(value);
+  if (!value || !domain || !isSafePublicUrl_(value)) return false;
+  if (isOfficialAhuDomain_(domain)) return true;
+  if (officialDomain && sameRegistrableDomain_(domain, officialDomain)) return true;
+  if (/\.(?:go|gov)\.id$/.test(domain)) return true;
+  if (/\.(?:ac|sch|or)\.id$/.test(domain)) return true;
+
+  // Sumber organisasi resmi yang tidak memakai subdomain .or.id tetap boleh
+  // menjadi legalEvidenceSource, tetapi hanya bila identitas organisasi jelas.
+  const identity = buildCompanyIdentity_(companyName || '');
+  const normalizedDomain = normalizeText_(domain);
+  return identity.domainStems.some(function (stem) {
+    return stem && normalizedDomain.indexOf(normalizeText_(stem)) !== -1;
+  }) && /\.(?:org|com|id)$/.test(domain);
+}
+
+function inferLegalEntityType_(legalEntityName, fallbackEntityType) {
+  const form = extractAhuLegalForm_(legalEntityName || '');
+  if (form) return form;
+  const value = cleanText_(fallbackEntityType).toUpperCase();
+  return ENTITY_TYPES_.indexOf(value) !== -1 ? value : '';
+}
+
+function extractAhuNumber_(evidenceText) {
+  const text = cleanText_(evidenceText).replace(/\s+/g, ' ');
+  if (!text) return '';
+  const match = text.match(/\b(?:AHU(?:[-/ ]?\d+)?|Nomor\s+(?:AHU|SK|Keputusan)|No\.?\s*(?:AHU|SK))\s*[:#№-]?\s*[A-Z0-9./-]{3,80}/i);
+  return match ? cleanText_(match[0]) : '';
 }
 
 function extractAhuLegalForm_(evidenceText) {
@@ -2693,8 +2973,18 @@ function extractAhuRegisteredName_(evidenceText, companyName) {
   const text = cleanText_(evidenceText).replace(/\s+/g, ' ');
   if (!text) return '';
 
+  const identity = buildCompanyIdentity_(companyName || '');
+  const knownNames = unique_([companyName, identity.canonicalName].map(cleanText_).filter(Boolean))
+    .sort(function (a, b) { return b.length - a.length; });
+  const legalPrefixes = '(?:PT|CV|TBK|PERUM|BUMN|BUMD|YAYASAN|PERKUMPULAN|KOPERASI|PERSYARIKATAN|ORGANISASI|BADAN\\s+HUKUM|PERSEROAN\\s+TERBATAS|PERUSAHAAN\\s+UMUM)';
+  for (var i = 0; i < knownNames.length; i++) {
+    const namePattern = escapeRegExp_(knownNames[i]).replace(/\s+/g, '\\s+');
+    const knownMatch = text.match(new RegExp('\\b(' + legalPrefixes + '\\s+' + namePattern + ')(?=\\s|[,|;.]|$)', 'i'));
+    if (knownMatch) return cleanText_(knownMatch[1]).replace(/[.,;:-]+$/, '');
+  }
+
   const legalNameMatch = text.match(
-    /\b((?:(?:PT|CV|TBK|PERUM|BUMN|BUMD|YAYASAN|PERKUMPULAN|KOPERASI|PERSYARIKATAN|ORGANISASI|BADAN\s+HUKUM|PERSEROAN\s+TERBATAS|PERUSAHAAN\s+UMUM)\s+)[A-Z0-9][A-Z0-9 .,&()\/'-]{2,140}?)(?=\s+(?:BERKEDUDUKAN|TELAH|TERDAFTAR|NOMOR|ADALAH|YANG|SEBAGAI)\b|[|;]|$)/i
+    /\b((?:(?:PT|CV|TBK|PERUM|BUMN|BUMD|YAYASAN|PERKUMPULAN|KOPERASI|PERSYARIKATAN|ORGANISASI|BADAN\s+HUKUM|PERSEROAN\s+TERBATAS|PERUSAHAAN\s+UMUM)\s+)[A-Z0-9][A-Z0-9 .,&()\/'-]{2,140}?)(?=\s+(?:BERKEDUDUKAN|TELAH|TERDAFTAR|NOMOR|ADALAH|YANG|SEBAGAI|PENYELENGGARA|DIDIRIKAN)\b|[|;,.]|$)/i
   );
   if (legalNameMatch) return cleanText_(legalNameMatch[1]).replace(/[.,;:-]+$/, '');
 
@@ -2713,19 +3003,22 @@ function inferOfficialWebsite_(results, companyName, location) {
   results.forEach(function (item, index) {
     const url = cleanText_(item.url);
     const domain = getDomain_(url);
-    if (!url || !domain || isBlockedOfficialDomain_(domain) || seen[domain]) return;
+    const rootDomain = getRegistrableDomain_(domain);
+    if (!url || !domain || !rootDomain || isBlockedOfficialUrl_(url) || seen[canonicalSourceUrl_(url)]) return;
 
     const title = normalizeText_(item.title || '');
     const description = normalizeText_(item.description || '');
     const haystack = normalizeText_([title, description, url].join(' '));
 
-    const identityMatch = getCompanyIdentityMatch_(identity, [title, description, url].join(' '), domain);
+    const identityMatch = getCompanyIdentityMatch_(identity, [title, description, url].join(' '), rootDomain);
     if (!identityMatch.matched) return;
 
     const domainMatches = identityMatch.matchedDomainStem ? 1 : 0;
     const locationMatches = countTokenMatches_(locationTokens, haystack);
     const exactNameInTitle = containsNormalizedPhrase_(title, identity.canonicalKey);
     const officialClaim = /\bofficial\b|\bresmi\b/.test(haystack);
+    const rootRank = domain === rootDomain ? 2 : 1;
+    const campaignSubdomain = isCampaignOrUtilitySubdomain_(domain);
 
     // Website resmi harus memiliki sinyal kuat. Ini mencegah direktori wisata/lowongan
     // yang hanya menyebut nama perusahaan dipilih sebagai website resmi.
@@ -2733,27 +3026,38 @@ function inferOfficialWebsite_(results, companyName, location) {
 
     var score = identityMatch.tokenMatches * 14 + Math.max(0, 10 - index);
     score += domainMatches * 35;
+    score += rootRank === 2 ? 45 : 12;
     if (exactNameInTitle) score += 20;
     if (identityMatch.aliasMatched) score += 10;
     if (officialClaim) score += 8;
     if (locationMatches) score += Math.min(8, locationMatches * 3);
     if (/\.co\.id$|\.id$/.test(domain)) score += 2;
+    if (campaignSubdomain) score -= 25;
 
-    const hasStrongOwnershipSignal = domainMatches > 0 || officialClaim;
+    const hasStrongOwnershipSignal = domainMatches > 0 || officialClaim || rootRank === 2;
     const status = score >= 55 && hasStrongOwnershipSignal ? 'MATCH' : 'REVIEW';
-    seen[domain] = true;
+    seen[canonicalSourceUrl_(url)] = true;
+    const canonicalWebsite = rootRank === 2 ? getOrigin_(url) : 'https://' + rootDomain;
     candidates.push({
-      url: getOrigin_(url),
-      website: getOrigin_(url),
-      domain: domain,
-      domainStem: getDomainStem_(domain),
+      url: canonicalWebsite,
+      website: canonicalWebsite,
+      domain: rootDomain,
+      sourceDomain: domain,
+      rootDomain: rootDomain,
+      rootRank: rootRank,
+      campaignSubdomain: campaignSubdomain,
+      domainStem: getDomainStem_(rootDomain),
       status: status,
       score: score,
       source: url
     });
   });
 
-  candidates.sort(function (a, b) { return b.score - a.score; });
+  candidates.sort(function (a, b) {
+    if (a.rootDomain === b.rootDomain && a.rootRank !== b.rootRank) return b.rootRank - a.rootRank;
+    if (a.status !== b.status) return a.status === 'MATCH' ? -1 : 1;
+    return b.score - a.score;
+  });
   return candidates.length ? candidates[0] : {
     url: '',
     website: '',
@@ -2776,6 +3080,11 @@ function inferSocialProfile_(results, companyName, location, platform) {
     const rawUrl = cleanText_(item.url);
     const normalizedUrl = normalizeSocialProfileUrl_(rawUrl, platform);
     if (!normalizedUrl || seen[normalizedUrl]) return;
+    const linkedinProfileType = String(platform).toUpperCase() === 'LINKEDIN'
+      ? ((normalizedUrl.match(/linkedin\.com\/(company|school)\//i) || [])[1] || '').toLowerCase()
+      : '';
+    const requestedEntityType = resolveEntityType_(companyName, '', location);
+    if (linkedinProfileType === 'school' && !isEducationalEntityType_(requestedEntityType)) return;
 
     const title = normalizeText_(item.title || '');
     const description = normalizeText_(item.description || '');
@@ -2890,7 +3199,7 @@ function fetchPageHtml_(url, runId) {
       method: 'get',
       headers: {
         'Accept': 'text/html,application/xhtml+xml',
-        'User-Agent': 'Mozilla/5.0 (compatible; CompanyEmailValidator/3.3.4)'
+        'User-Agent': 'Mozilla/5.0 (compatible; CompanyEmailValidator/3.3.5)'
       },
       muteHttpExceptions: true,
       followRedirects: true,
@@ -3088,7 +3397,7 @@ function fetchPageText_(url, runId) {
       method: 'get',
       headers: {
         'Accept': 'text/html,application/xhtml+xml,text/plain',
-        'User-Agent': 'Mozilla/5.0 (compatible; CompanyEmailValidator/3.3.4)'
+        'User-Agent': 'Mozilla/5.0 (compatible; CompanyEmailValidator/3.3.5)'
       },
       muteHttpExceptions: true,
       followRedirects: true,
@@ -3136,7 +3445,7 @@ function assertValidatorApiKey_() {
     EMAIL_VALIDATOR_CONFIG.API_KEY_PROPERTY
   ));
   if (!key) {
-    throw new Error('OpenAI API key belum disimpan. Gunakan menu Email Validator â†’ Simpan OpenAI API Key.');
+    throw new Error('OpenAI API key belum disimpan. Gunakan menu Email Validator → Simpan OpenAI API Key.');
   }
   return key;
 }
@@ -3215,13 +3524,13 @@ function normalizeEvidenceText_(text) {
 function normalizeText_(value) {
   return cleanText_(value)
     .toLowerCase()
-    .replace(/[Ã Ã¡Ã¢Ã£Ã¤Ã¥]/g, 'a')
-    .replace(/[Ã¨Ã©ÃªÃ«]/g, 'e')
-    .replace(/[Ã¬Ã­Ã®Ã¯]/g, 'i')
-    .replace(/[Ã²Ã³Ã´ÃµÃ¶]/g, 'o')
-    .replace(/[Ã¹ÃºÃ»Ã¼]/g, 'u')
-    .replace(/[Ã§]/g, 'c')
-    .replace(/[Ã±]/g, 'n')
+    .replace(/[àáâãäå]/g, 'a')
+    .replace(/[èéêë]/g, 'e')
+    .replace(/[ìíîï]/g, 'i')
+    .replace(/[òóôõö]/g, 'o')
+    .replace(/[ùúûü]/g, 'u')
+    .replace(/[ç]/g, 'c')
+    .replace(/[ñ]/g, 'n')
     .replace(/[^a-z0-9]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -3262,6 +3571,33 @@ function getDomainStem_(domain) {
   return labels[labels.length - 2];
 }
 
+function getRegistrableDomain_(domain) {
+  const value = getDomain_(domain);
+  if (!value) return '';
+  const labels = value.split('.').filter(Boolean);
+  if (labels.length < 2) return value;
+  const publicSecondLevel = ['co', 'ac', 'or', 'go', 'sch', 'net', 'web'];
+  if (labels.length >= 3 && labels[labels.length - 1] === 'id' &&
+      publicSecondLevel.indexOf(labels[labels.length - 2]) !== -1) {
+    return labels.slice(-3).join('.');
+  }
+  return labels.slice(-2).join('.');
+}
+
+function isSubdomainOf_(domain, rootDomain) {
+  const child = getDomain_(domain);
+  const root = getDomain_(rootDomain);
+  return Boolean(child && root && (child === root || endsWithText_(child, '.' + root)));
+}
+
+function isCampaignOrUtilitySubdomain_(domain) {
+  const value = getDomain_(domain);
+  const root = getRegistrableDomain_(value);
+  if (!value || !root || value === root) return false;
+  const firstLabel = value.slice(0, -(root.length + 1));
+  return /(^|\.)(penmaru|pmb|spmb|admisi|admission|admissions|registrasi|penerimaan|ppmb|career|careers|job|jobs|rekrutmen|portal|info|mail|news|media|blog|shop|marketplace)(\.|$)/i.test(firstLabel);
+}
+
 function domainStemMatches_(domain, stem) {
   const domainValue = getDomain_(domain);
   const expected = cleanText_(stem).toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -3278,10 +3614,10 @@ function endsWithText_(value, suffix) {
 }
 
 function sameRegistrableDomain_(domainA, domainB) {
-  const a = getDomain_(domainA);
-  const b = getDomain_(domainB);
+  const a = getRegistrableDomain_(domainA);
+  const b = getRegistrableDomain_(domainB);
   if (!a || !b) return false;
-  return a === b || endsWithText_(a, '.' + b) || endsWithText_(b, '.' + a);
+  return a === b;
 }
 
 function isBlockedOfficialDomain_(domain) {
@@ -3289,6 +3625,13 @@ function isBlockedOfficialDomain_(domain) {
   return BLOCKED_OFFICIAL_DOMAINS_.some(function (blocked) {
     return value === blocked || endsWithText_(value, '.' + blocked);
   });
+}
+
+function isBlockedOfficialUrl_(url) {
+  const value = cleanText_(url);
+  if (!value || isBlockedOfficialDomain_(getDomain_(value))) return true;
+  const path = value.replace(/^https?:\/\/[^/]+/i, '').toLowerCase();
+  return /\/(?:job|jobs|career|careers|lowongan|loker|media|news|blog|directory|direktori|marketplace|shop|store|listing|company|profile)(?:[/?#]|$)/i.test(path);
 }
 
 function isSafePublicUrl_(url) {
@@ -3335,7 +3678,7 @@ function escapeRegExp_(value) {
 
 function truncate_(text, maxLength) {
   const value = String(text || '');
-  return value.length <= maxLength ? value : value.slice(0, maxLength) + 'â€¦';
+  return value.length <= maxLength ? value : value.slice(0, maxLength) + '…';
 }
 
 function getErrorMessage_(error) {
