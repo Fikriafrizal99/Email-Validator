@@ -54,6 +54,7 @@ const EMAIL_VALIDATOR_CONFIG = Object.freeze({
   SPREADSHEET_ID_PROPERTY: 'EMAIL_VALIDATOR_SPREADSHEET_ID_V4',
   LAST_ERROR_PROPERTY: 'EMAIL_VALIDATOR_LAST_ERROR_V4',
   COMPANY_CACHE_INVALIDATION_PROPERTY: 'EMAIL_VALIDATOR_COMPANY_CACHE_INVALIDATED_V335',
+  SEARCH_ADAPTER_CACHE_INVALIDATION_PROPERTY: 'EMAIL_VALIDATOR_SEARCH_ADAPTER_CACHE_INVALIDATED_V335_FIX1',
   CONTINUE_HANDLER: 'processEmailValidatorBatch',
   SOURCE_HEADERS_TO_COPY: [
     'Verification Date', 'No', 'Team', 'Position',
@@ -519,6 +520,7 @@ function processExplicitValidationRows_(ss, sourceSheet, rows, forceEmailRefresh
   const reviewSheet = ensureReviewSheet_(ss);
   const evidenceSheet = ensureEvidenceSheet_(ss);
   const companySheet = ensureCompanyMasterSheet_(ss);
+  invalidateEmptyDiscoveryCacheOnce_(companySheet, rawSheet);
   const rawIndex = loadRawIndex_(rawSheet);
   const reviewIndex = loadReviewIndex_(reviewSheet);
   const evidenceIndex = loadReviewIndex_(evidenceSheet);
@@ -1168,6 +1170,62 @@ function invalidateCompanyMasterCacheOnce_(sheet) {
       }
     });
   }
+  properties.setProperty(marker, EMAIL_VALIDATOR_CONFIG.VERSION);
+}
+
+/**
+ * Hotfix v3.3.5: cache email diperiksa sebelum Company Master. Akibatnya hasil
+ * discovery kosong dari engine lama dapat melewati invalidasi Company Master.
+ * Tandai hanya baris discovery kosong sebagai stale, tanpa menghapus data.
+ */
+function invalidateEmptyDiscoveryCacheOnce_(companySheet, rawSheet) {
+  const properties = PropertiesService.getDocumentProperties();
+  const marker = EMAIL_VALIDATOR_CONFIG.SEARCH_ADAPTER_CACHE_INVALIDATION_PROPERTY;
+  if (properties.getProperty(marker) === EMAIL_VALIDATOR_CONFIG.VERSION) return;
+
+  function invalidateSheet(sheet, isCompanyMaster) {
+    if (!sheet || sheet.getLastRow() < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW) return;
+    const map = getHeaderMap_(sheet);
+    const versionCol = map['Validator Version'];
+    if (!versionCol) return;
+
+    const rowCount = sheet.getLastRow() - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW + 1;
+    const values = sheet.getRange(
+      EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW, 1, rowCount, sheet.getLastColumn()
+    ).getValues();
+    const versions = values.map(function (row) {
+      const currentVersion = cleanText_(row[versionCol - 1]);
+      const manualLock = isCompanyMaster && map['Manual Lock']
+        ? cleanText_(row[map['Manual Lock'] - 1]).toUpperCase()
+        : '';
+      if (manualLock === 'YES') return [currentVersion];
+
+      const website = map['Official Website'] ? cleanText_(row[map['Official Website'] - 1]) : '';
+      const linkedinHeader = map['LinkedIn Company'] ? 'LinkedIn Company' : 'LinkedIn';
+      const linkedin = map[linkedinHeader] ? cleanText_(row[map[linkedinHeader] - 1]) : '';
+      const instagram = map['Instagram'] ? cleanText_(row[map['Instagram'] - 1]) : '';
+      const ahuStatus = map['AHU Status']
+        ? cleanText_(row[map['AHU Status'] - 1]).toUpperCase()
+        : '';
+      const exactEmailFound = map['Exact Email Found']
+        ? cleanText_(row[map['Exact Email Found'] - 1]).toUpperCase()
+        : '';
+      const hasLegalEvidence = [
+        'DIRECT_MATCH', 'PARENT_ENTITY_MATCH', 'REVIEW', 'MANUAL_AHU_CHECK'
+      ].indexOf(ahuStatus) !== -1;
+      const discoveryEmpty = !website && !linkedin && !instagram &&
+        !hasLegalEvidence && exactEmailFound !== 'FOUND';
+
+      return [discoveryEmpty ? 'INVALIDATED_V335_SEARCH_FIX1' : currentVersion];
+    });
+
+    sheet.getRange(
+      EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW, versionCol, rowCount, 1
+    ).setValues(versions);
+  }
+
+  invalidateSheet(companySheet, true);
+  invalidateSheet(rawSheet, false);
   properties.setProperty(marker, EMAIL_VALIDATOR_CONFIG.VERSION);
 }
 
@@ -2282,7 +2340,9 @@ function openAIWebSearch_(query, runId) {
       }
     }],
     tool_choice: 'required',
-    max_tool_calls: 1,
+    // Beri ruang untuk agentic search menyelesaikan pencarian dan membentuk
+    // jawaban. Batas 1 dapat menghasilkan response incomplete tanpa message.
+    max_tool_calls: 3,
     include: ['web_search_call.action.sources'],
     text: {
       format: {
@@ -2337,6 +2397,12 @@ function openAIWebSearch_(query, runId) {
   if (payload.error) {
     throw new Error('OpenAI Web Search gagal: ' + truncate_(payload.error.message || JSON.stringify(payload.error), 500));
   }
+  if (payload.status === 'incomplete') {
+    const reason = payload.incomplete_details && payload.incomplete_details.reason
+      ? payload.incomplete_details.reason
+      : 'unknown_reason';
+    throw new Error('OpenAI Web Search tidak selesai: ' + reason);
+  }
 
   const sourceItems = collectOpenAIWebSources_(payload);
   const sourceSet = {};
@@ -2355,19 +2421,34 @@ function openAIWebSearch_(query, runId) {
   }
 
   const hasSourceList = Object.keys(sourceSet).length > 0;
+  if (!hasSourceList) {
+    const outputItems = payload && Array.isArray(payload.output) ? payload.output : [];
+    const hasWebSearchCall = outputItems.some(function (item) {
+      return item && item.type === 'web_search_call';
+    });
+    // Pencarian completed yang memang tidak menemukan hasil adalah [] yang
+    // valid (misalnya exact-email tidak publik). Structured URL tanpa source,
+    // atau response tanpa web_search_call, tetap ditolak.
+    if (!hasWebSearchCall || parsedResults.length) {
+      throw new Error('OpenAI Web Search tidak mengembalikan source/citation yang mendukung hasil.');
+    }
+    return [];
+  }
   const seen = {};
   const normalized = [];
   parsedResults.forEach(function (item) {
     if (normalized.length >= maxResults) return;
     const resultUrl = cleanText_(item && item.url);
-    const key = canonicalSourceUrl_(resultUrl);
-    if (!resultUrl || !key || seen[key]) return;
-    if (hasSourceList && !sourceSet[key]) return; // cegah URL hasil fabrikasi model.
+    const backedSource = findSourceBacking_(sourceItems, resultUrl);
+    const backedUrl = backedSource ? cleanText_(backedSource.url) : '';
+    const key = canonicalSourceUrl_(backedUrl);
+    if (!backedUrl || !key || seen[key]) return;
 
     seen[key] = true;
     normalized.push({
-      title: cleanText_(item.title),
-      url: resultUrl,
+      title: cleanText_(item.title) || cleanText_(backedSource.title),
+      // URL final selalu URL yang benar-benar ada di sources/citations.
+      url: backedUrl,
       description: cleanText_(item.description),
       extra_snippets: Array.isArray(item.extra_snippets)
         ? item.extra_snippets.map(cleanText_).filter(Boolean).slice(0, 3)
@@ -2375,22 +2456,20 @@ function openAIWebSearch_(query, runId) {
     });
   });
 
-  // Fallback: jika structured text kosong/tidak cocok, tetap gunakan URL source/citation
-  // yang benar-benar dikembalikan oleh Web Search.
-  if (!normalized.length) {
-    sourceItems.forEach(function (item) {
-      if (normalized.length >= maxResults) return;
-      const key = canonicalSourceUrl_(item.url);
-      if (!key || seen[key]) return;
-      seen[key] = true;
-      normalized.push({
-        title: cleanText_(item.title),
-        url: cleanText_(item.url),
-        description: '',
-        extra_snippets: []
-      });
+  // Selalu append source yang belum masuk. Dengan demikian structured output
+  // yang kosong/tidak cocok tidak menghilangkan URL hasil pencarian asli.
+  sourceItems.forEach(function (item) {
+    if (normalized.length >= maxResults) return;
+    const key = canonicalSourceUrl_(item.url);
+    if (!key || seen[key]) return;
+    seen[key] = true;
+    normalized.push({
+      title: cleanText_(item.title),
+      url: cleanText_(item.url),
+      description: '',
+      extra_snippets: []
     });
-  }
+  });
 
   return normalized.slice(0, maxResults);
 }
@@ -2442,6 +2521,26 @@ function collectOpenAIWebSources_(payload) {
   });
 
   return results;
+}
+
+function findSourceBacking_(sourceItems, resultUrl) {
+  const resultKey = canonicalSourceUrl_(resultUrl);
+  if (!resultKey) return null;
+
+  for (var i = 0; i < sourceItems.length; i++) {
+    if (canonicalSourceUrl_(sourceItems[i].url) === resultKey) return sourceItems[i];
+  }
+
+  // Root/subdomain canonicalization hanya aman untuk website biasa. Untuk
+  // social profile, path profile harus tetap exact agar akun lain tidak ikut.
+  const resultDomain = getDomain_(resultUrl);
+  if (/linkedin\.com$|instagram\.com$/i.test(getRegistrableDomain_(resultDomain))) return null;
+  const resultRoot = getRegistrableDomain_(resultDomain);
+  if (!resultRoot) return null;
+  for (var j = 0; j < sourceItems.length; j++) {
+    if (getRegistrableDomain_(getDomain_(sourceItems[j].url)) === resultRoot) return sourceItems[j];
+  }
+  return null;
 }
 
 function canonicalSourceUrl_(url) {
@@ -2586,6 +2685,15 @@ function buildCompanySearchQuery_(companyName, location, suffix) {
   ].filter(Boolean).join(' ');
 }
 
+function buildDirectCompanySearchQuery_(companyName, location, suffix) {
+  const identity = buildCompanyIdentity_(companyName);
+  return [
+    '"' + sanitizeSearchPhrase_(identity.canonicalName || companyName) + '"',
+    cleanText_(location),
+    cleanText_(suffix)
+  ].filter(Boolean).join(' ');
+}
+
 function buildAhuSearchQuery_(companyName, location, fallback) {
   const identity = buildCompanyIdentity_(companyName);
   const aliases = (fallback ? identity.aliases : [companyName]).slice(0, 6).map(function (alias) {
@@ -2657,11 +2765,19 @@ function findCompanyPresence_(companyName, location, runId) {
   const locationText = cleanText_(location);
   const entityType = resolveEntityType_(companyName, '', locationText);
 
-  const websiteResults = openAIWebSearch_(
-    buildCompanySearchQuery_(companyName, locationText, 'official website'), runId
+  // Mulai dari nama lengkap agar query alias panjang tidak menenggelamkan hasil
+  // resmi. Resolver alias/stem tetap menjadi fallback bila direct query gagal.
+  var websiteResults = openAIWebSearch_(
+    buildDirectCompanySearchQuery_(companyName, locationText, 'official website'), runId
   );
-
-  const website = inferOfficialWebsite_(websiteResults, companyName, locationText);
+  var website = inferOfficialWebsite_(websiteResults, companyName, locationText);
+  if (website.status !== 'MATCH') {
+    const websiteFallbackResults = openAIWebSearch_(
+      buildCompanySearchQuery_(companyName, locationText, 'official website'), runId
+    );
+    const websiteFallback = inferOfficialWebsite_(websiteFallbackResults, companyName, locationText);
+    if ((websiteFallback.score || 0) > (website.score || 0)) website = websiteFallback;
+  }
   const linkedProfiles = website.status === 'MATCH' && website.url
     ? extractSocialLinksFromWebsite_(website.url, runId)
     : { linkedin: '', instagram: '' };
@@ -2671,14 +2787,26 @@ function findCompanyPresence_(companyName, location, runId) {
     linkedin = { url: linkedProfiles.linkedin, status: 'OFFICIAL_LINK', score: 100, source: website.url };
   } else {
     const linkedinSiteQuery = isEducationalEntityType_(entityType)
-      ? '(site:linkedin.com/school OR site:linkedin.com/company)'
-      : 'site:linkedin.com/company';
-    const linkedinResults = openAIWebSearch_([
+      ? 'site:linkedin.com/school/'
+      : 'site:linkedin.com/company/';
+    var linkedinResults = openAIWebSearch_([
       linkedinSiteQuery,
-      buildCompanySearchQuery_(companyName, locationText, ''),
-      'official profile'
+      buildDirectCompanySearchQuery_(companyName, locationText, 'official profile')
     ].filter(Boolean).join(' '), runId);
     linkedin = inferSocialProfile_(linkedinResults, companyName, locationText, 'LINKEDIN');
+    if (linkedin.status !== 'MATCH') {
+      const linkedinFallbackResults = openAIWebSearch_([
+        isEducationalEntityType_(entityType)
+          ? '(site:linkedin.com/school/ OR site:linkedin.com/company/)'
+          : 'site:linkedin.com/company/',
+        buildCompanySearchQuery_(companyName, locationText, ''),
+        'official profile'
+      ].filter(Boolean).join(' '), runId);
+      const linkedinFallback = inferSocialProfile_(
+        linkedinFallbackResults, companyName, locationText, 'LINKEDIN'
+      );
+      if ((linkedinFallback.score || 0) > (linkedin.score || 0)) linkedin = linkedinFallback;
+    }
   }
 
   var instagram;
@@ -3103,7 +3231,10 @@ function inferSocialProfile_(results, companyName, location, platform) {
     const slugMatches = matchedTermTokens.length
       ? countTokenMatches_(matchedTermTokens, slug)
       : 0;
-    const supportText = normalizeText_([title, description, location].join(' '));
+    // Hanya teks dari source yang boleh menjadi supporting evidence. Jangan
+    // memasukkan location input karena itu membuat setiap alias pendek seolah
+    // selalu didukung lokasi yang sedang dicari.
+    const supportText = normalizeText_([title, description].join(' '));
     const fullNameSupported = Boolean(
       containsNormalizedPhrase_(supportText, identity.canonicalKey) ||
       (identity.fullNameTokens.length > 0 &&
