@@ -1,0 +1,3018 @@
+/**
+ * EMAIL VALIDATOR UNTUK GOOGLE SHEETS
+ * Versi: 3.3.3 - OpenAI Web Search + social/AHU fix + diagnostics-clean
+ *
+ * Sumber data : sheet "Job Board"
+ * Header wajib: "Company Name", "Contact Type", "Contact"
+ *
+ * Sheet yang dibuat:
+ * - Ringkasan Validasi     : dashboard sederhana dan panduan membaca hasil.
+ * - Email Review           : tampilan kerja utama yang ringkas untuk keputusan cepat.
+ * - Email Evidence         : detail investigasi Web, LinkedIn, Instagram, AHU, dan bukti publik.
+ * - Company Master         : database perusahaan agar OpenAI Web Search tidak mencari perusahaan yang sama berulang kali.
+ * - Email Validation Raw   : database teknis/audit trail lengkap; disembunyikan secara default.
+ *
+ * Catatan migrasi tampilan:
+ * - Sheet lama "Email Review Detail" tidak dihapus. Jika ditemukan, sheet tersebut diarsipkan
+ *   menjadi "Email Review Detail (Legacy)" dan disembunyikan.
+ * - Data Review dan Evidence dapat dibangun ulang dari Email Validation Raw tanpa web search baru.
+ *
+ * Prinsip cache:
+ * - Data perusahaan disimpan 90 hari berdasarkan nama perusahaan yang dinormalisasi.
+ * - Hasil email disimpan 30 hari berdasarkan kombinasi perusahaan + email.
+ * - Perusahaan sama dengan email berbeda menggunakan Company Master dan hanya mencari bukti email spesifik.
+ * - Perusahaan dan email yang sama menggunakan cache penuh dan tidak memanggil OpenAI Web Search lagi.
+ */
+
+const EMAIL_VALIDATOR_CONFIG = Object.freeze({
+  VERSION: '3.3.3',
+  CACHE_COMPATIBLE_VERSIONS: ['3.2.0', '3.3.0', '3.3.2', '3.3.3'],
+  JOB_SHEET_NAME: 'Job Board',
+  SUMMARY_SHEET_NAME: 'Ringkasan Validasi',
+  REVIEW_SHEET_NAME: 'Email Review',
+  EVIDENCE_SHEET_NAME: 'Email Evidence',
+  LEGACY_REVIEW_SHEET_NAME: 'Email Review Detail',
+  LEGACY_REVIEW_ARCHIVE_SHEET_NAME: 'Email Review Detail (Legacy)',
+  COMPANY_SHEET_NAME: 'Company Master',
+  RAW_SHEET_NAME: 'Email Validation Raw',
+  LEGACY_SHEET_NAME: 'Email Validation Result',
+  HEADER_ROW: 1,
+  FIRST_DATA_ROW: 2,
+  BATCH_SIZE: 5,
+  CONTINUE_AFTER_MS: 60 * 1000,
+  REQUEST_DELAY_MS: 550,
+  MAX_SEARCH_RESULTS: 10,
+  MAX_PAGES_TO_INSPECT: 5,
+  OPENAI_MODEL: 'gpt-5.6-luna',
+  OPENAI_SEARCH_CONTEXT_SIZE: 'medium',
+  EMAIL_CACHE_MAX_AGE_DAYS: 30,
+  COMPANY_CACHE_MAX_AGE_DAYS: 90,
+  API_KEY_PROPERTY: 'OPENAI_API_KEY',
+  ACTIVE_RUN_ID_PROPERTY: 'EMAIL_VALIDATOR_ACTIVE_RUN_ID_V4',
+  BATCH_STATE_PROPERTY: 'EMAIL_VALIDATOR_BATCH_STATE_V4',
+  SPREADSHEET_ID_PROPERTY: 'EMAIL_VALIDATOR_SPREADSHEET_ID_V4',
+  LAST_ERROR_PROPERTY: 'EMAIL_VALIDATOR_LAST_ERROR_V4',
+  CONTINUE_HANDLER: 'processEmailValidatorBatch',
+  SOURCE_HEADERS_TO_COPY: [
+    'Verification Date', 'No', 'Team', 'Position',
+    'Company Name', 'Contact Type', 'Contact'
+  ],
+  REVIEW_HEADERS: [
+    'Source Row',
+    'No', 'Team', 'Position', 'Company Name', 'Email',
+    'Final Status', 'Recommended Action',
+    'Email Format', 'Domain MX', 'Domain Match', 'Exact Email Found',
+    'Company Presence Status', 'Validation Score',
+    'Evidence Type', 'Validation Notes', 'Last Checked'
+  ],
+  EVIDENCE_HEADERS: [
+    'Source Row', 'Company Name', 'Email', 'Final Status',
+    'Official Website', 'Website Match', 'Email on Website', 'Website Evidence',
+    'LinkedIn Company', 'LinkedIn Match', 'Email on LinkedIn', 'LinkedIn Evidence',
+    'Instagram', 'Instagram Match', 'Email on Instagram', 'Instagram Evidence',
+    'AHU Status', 'AHU Registered Name', 'AHU Evidence',
+    'Other Email Evidence'
+  ],
+  COMPANY_HEADERS: [
+    'Company Key', 'Company Name', 'Location', 'Official Website',
+    'Official Domain', 'LinkedIn', 'Instagram',
+    'AHU Status', 'AHU Registered Name', 'AHU Evidence',
+    'Company Status', 'Data Source', 'Last Checked', 'Manual Lock', 'Notes'
+  ],
+  RAW_HEADERS: [
+    'Source Row', 'Verification Date', 'No', 'Team', 'Position',
+    'Company Name', 'Contact Type', 'Email', 'Email Domain',
+    'Email Format', 'Domain MX',
+    'Official Website', 'Website Match',
+    'LinkedIn Company', 'LinkedIn Match',
+    'Instagram', 'Instagram Match',
+    'AHU Status', 'AHU Registered Name', 'AHU Evidence',
+    'Company Presence Score', 'Company Presence Status', 'Official Domain',
+    'Domain Match', 'Exact Email Found',
+    'Company Matched', 'Other Company Suspected',
+    'Evidence Type', 'Evidence Source',
+    'Email on Website', 'Website Evidence',
+    'Email on LinkedIn', 'LinkedIn Evidence',
+    'Email on Instagram', 'Instagram Evidence',
+    'Other Email Evidence',
+    'Validation Score', 'Validation Status', 'Validation Notes',
+    'Company Data Source', 'Email Data Source',
+    'Validator Version', 'Last Checked'
+  ]
+});
+
+const FREE_EMAIL_DOMAINS_ = Object.freeze([
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.id',
+  'outlook.com', 'hotmail.com', 'live.com', 'icloud.com',
+  'aol.com', 'proton.me', 'protonmail.com', 'ymail.com'
+]);
+
+const BLOCKED_OFFICIAL_DOMAINS_ = Object.freeze([
+  'linkedin.com', 'facebook.com', 'instagram.com', 'tiktok.com', 'youtube.com',
+  'jobstreet.co.id', 'jobstreet.com', 'glints.com', 'kalibrr.com', 'indeed.com',
+  'dealls.com', 'loker.id', 'kitalulus.com', 'karir.com', 'jobs.id',
+  'google.com', 'googleusercontent.com', 'blogspot.com', 'wordpress.com',
+  'wixsite.com', 'x.com', 'twitter.com', 'telegram.me', 't.me',
+  'trip.com', 'traveloka.com', 'agoda.com', 'booking.com', 'expedia.com',
+  'zomato.com', 'pergikuliner.com', 'restaurantguru.com', 'foursquare.com',
+  'yelp.com', 'yellowpages.co.id', 'gofood.co.id', 'grab.com', 'shopee.co.id',
+  'tokopedia.com', 'semuabis.com', 'cybo.com', 'idalamat.com', 'carilokasi.com'
+]);
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Email Validator')
+    .addItem('1. Siapkan & rapikan sheet', 'prepareEmailValidatorWorkspace')
+    .addItem('2. Simpan OpenAI API Key', 'setupValidatorOpenAIApiKey')
+    .addItem('3. Uji koneksi', 'testEmailValidatorConnection')
+    .addSeparator()
+    .addItem('Migrasi hasil v2.1 tanpa pencarian baru', 'migrateLegacyValidationResults')
+    .addItem('Bangun ulang Review + Evidence dari Raw', 'rebuildReviewFromRaw')
+    .addSeparator()
+    .addItem('Validasi email baris terpilih', 'validateSelectedEmailRows')
+    .addItem('Validasi semua email baru', 'startValidateAllEmails')
+    .addItem('Validasi ulang yang perlu dicek', 'startRetryReviewEmails')
+    .addItem('Refresh perusahaan terpilih', 'refreshSelectedCompanies')
+    .addSeparator()
+    .addItem('Buka Ringkasan', 'openValidationSummary')
+    .addItem('Buka Email Review', 'openEmailReview')
+    .addItem('Buka Email Evidence', 'openEmailEvidence')
+    .addItem('Buka Company Master', 'openCompanyMaster')
+    .addSeparator()
+    .addItem('Hentikan proses otomatis', 'stopEmailValidatorBatch')
+    .addItem('Lihat status proses', 'showEmailValidatorStatus')
+    .addToUi();
+}
+
+function prepareEmailValidatorWorkspace() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  archiveLegacyReviewSheet_(ss);
+  ensureReviewSheet_(ss);
+  ensureEvidenceSheet_(ss);
+  ensureCompanyMasterSheet_(ss);
+  ensureRawSheet_(ss);
+  ensureSummarySheet_(ss);
+  rebuildViewsFromRaw_(ss);
+  updateSummarySheet_(ss);
+  ss.setActiveSheet(ensureReviewSheet_(ss));
+  ss.toast('Workspace siap: Review ringkas, Evidence detail, dan Raw audit trail.', 'Email Validator', 8);
+}
+
+function openValidationSummary() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  updateSummarySheet_(ss);
+  ss.setActiveSheet(ensureSummarySheet_(ss));
+}
+
+function openEmailReview() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.setActiveSheet(ensureReviewSheet_(ss));
+}
+
+function openEmailEvidence() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.setActiveSheet(ensureEvidenceSheet_(ss));
+}
+
+function openCompanyMaster() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.setActiveSheet(ensureCompanyMasterSheet_(ss));
+}
+
+function setupValidatorOpenAIApiKey() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt(
+    'Simpan OpenAI API Key',
+    'Masukkan OpenAI API key. Key disimpan di Script Properties, bukan di sel spreadsheet.',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const apiKey = cleanText_(response.getResponseText());
+  if (!apiKey) {
+    ui.alert('API key tidak boleh kosong.');
+    return;
+  }
+  PropertiesService.getScriptProperties().setProperty(EMAIL_VALIDATOR_CONFIG.API_KEY_PROPERTY, apiKey);
+  ui.alert('OpenAI API key berhasil disimpan. Lanjutkan dengan menu "Uji koneksi".');
+}
+
+// Alias sementara agar pemanggilan lama tidak langsung rusak setelah upgrade.
+function setupValidatorBraveApiKey() {
+  setupValidatorOpenAIApiKey();
+}
+
+function testEmailValidatorConnection() {
+  try {
+    const searchResults = openAIWebSearch_('OpenAI official website');
+    const mx = lookupMx_('gmail.com');
+    SpreadsheetApp.getUi().alert(
+      'Koneksi berhasil',
+      'OpenAI Web Search: ' + searchResults.length + ' hasil\nDNS/MX: ' + (mx.hasMx ? 'aktif' : 'tidak terbaca'),
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  } catch (error) {
+    SpreadsheetApp.getUi().alert('Koneksi gagal', getErrorMessage_(error), SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+function validateSelectedEmailRows() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sourceSheet = ss.getActiveSheet();
+  if (sourceSheet.getName() !== EMAIL_VALIDATOR_CONFIG.JOB_SHEET_NAME) {
+    SpreadsheetApp.getUi().alert('Buka sheet "Job Board" lalu pilih baris yang ingin divalidasi.');
+    return;
+  }
+
+  assertValidatorApiKey_();
+  ensureWorkspace_(ss);
+  const range = sourceSheet.getActiveRange();
+  if (!range) return;
+
+  const startRow = Math.max(range.getRow(), EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW);
+  const endRow = Math.max(startRow, range.getLastRow());
+  const rows = [];
+  for (var row = startRow; row <= endRow; row++) rows.push(row);
+
+  const summary = processExplicitValidationRows_(ss, sourceSheet, rows, true);
+  updateSummarySheet_(ss);
+  ss.toast(
+    summary.processed + ' email diproses, ' + summary.skipped + ' baris dilewati.',
+    'Email Validator',
+    8
+  );
+}
+
+function startValidateAllEmails() {
+  startValidationBatch_('PENDING');
+}
+
+function startRetryReviewEmails() {
+  startValidationBatch_('RETRY');
+}
+
+function startValidationBatch_(mode) {
+  assertValidatorApiKey_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sourceSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.JOB_SHEET_NAME);
+  if (!sourceSheet) throw new Error('Sheet "Job Board" tidak ditemukan.');
+
+  const headerMap = getHeaderMap_(sourceSheet);
+  requireHeader_(headerMap, 'Company Name');
+  requireHeader_(headerMap, 'Contact Type');
+  requireHeader_(headerMap, 'Contact');
+  ensureWorkspace_(ss);
+
+  // Boundary dibuat saat START. Baris yang ditambahkan setelah proses dimulai
+  // tidak akan ikut terseret ke run yang sedang aktif.
+  const endRow = getLastValidationDataRow_(sourceSheet, headerMap);
+  if (endRow < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW) {
+    ss.toast('Tidak ada data email yang perlu dipindai.', 'Email Validator', 6);
+    return;
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  const runId = Utilities.getUuid();
+  deleteValidatorContinuationTriggers_();
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY);
+  props.setProperty(EMAIL_VALIDATOR_CONFIG.ACTIVE_RUN_ID_PROPERTY, runId);
+  props.setProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY, ss.getId());
+  props.setProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY, JSON.stringify({
+    runId: runId,
+    mode: mode,
+    nextRow: EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
+    endRow: endRow,
+    startedAt: new Date().toISOString(),
+    processed: 0,
+    skipped: 0,
+    verified: 0,
+    probable: 0,
+    manual: 0,
+    blocked: 0,
+    errors: 0
+  }));
+
+  ss.toast(
+    'Proses dimulai sampai row ' + endRow + '. Sistem memproses maksimal ' +
+      EMAIL_VALIDATOR_CONFIG.BATCH_SIZE + ' email per batch.',
+    'Email Validator', 7
+  );
+  processEmailValidatorBatch();
+}
+
+function processEmailValidatorBatch() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    // Jika run baru dimulai saat batch lama masih memegang lock, jangan biarkan
+    // state baru terlantar tanpa continuation trigger.
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+      if (stateText) {
+        const pendingState = JSON.parse(stateText);
+        const pendingRunId = cleanText_(pendingState.runId);
+        if (pendingRunId && isBatchRunActive_(pendingRunId)) {
+          scheduleValidatorContinuation_(pendingRunId);
+        }
+      }
+    } catch (error) { console.warn(getErrorMessage_(error)); }
+    return;
+  }
+  var runId = '';
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+    if (!stateText) {
+      deleteValidatorContinuationTriggers_();
+      return;
+    }
+
+    const state = JSON.parse(stateText);
+    runId = cleanText_(state.runId);
+    assertBatchRunActive_(runId);
+    assertValidatorApiKey_();
+
+    const spreadsheetId = props.getProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY);
+    if (!spreadsheetId) throw new Error('Spreadsheet ID proses tidak tersedia.');
+
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+    const sourceSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.JOB_SHEET_NAME);
+    if (!sourceSheet) throw new Error('Sheet Job Board tidak ditemukan.');
+    ensureWorkspace_(ss);
+
+    const rawIndex = loadRawIndex_(ensureRawSheet_(ss));
+    const sourceHeaderMap = getHeaderMap_(sourceSheet);
+    requireHeader_(sourceHeaderMap, 'Company Name');
+    requireHeader_(sourceHeaderMap, 'Contact Type');
+    requireHeader_(sourceHeaderMap, 'Contact');
+
+    const liveLastDataRow = getLastValidationDataRow_(sourceSheet, sourceHeaderMap);
+    const fixedEndRow = Number(state.endRow) || liveLastDataRow;
+    const lastRow = Math.min(fixedEndRow, liveLastDataRow);
+    if (lastRow < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW || state.nextRow > lastRow) {
+      finishValidationBatch_(ss, state);
+      return;
+    }
+
+    const values = sourceSheet.getRange(
+      EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
+      1,
+      lastRow - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW + 1,
+      sourceSheet.getLastColumn()
+    ).getDisplayValues();
+
+    const rowsToProcess = [];
+    var scanRow = Math.max(Number(state.nextRow) || EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
+      EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW);
+
+    while (scanRow <= lastRow && rowsToProcess.length < EMAIL_VALIDATOR_CONFIG.BATCH_SIZE) {
+      assertBatchRunActive_(runId);
+      const rowValues = values[scanRow - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW];
+      if (shouldProcessValidationRow_(scanRow, rowValues, sourceHeaderMap, rawIndex, state.mode)) {
+        rowsToProcess.push(scanRow);
+      } else {
+        state.skipped++;
+      }
+      scanRow++;
+    }
+
+    if (rowsToProcess.length) {
+      const summary = processExplicitValidationRows_(
+        ss, sourceSheet, rowsToProcess, state.mode === 'RETRY', runId
+      );
+      if (summary.stopped) {
+        deleteBatchStateIfRunMatches_(runId);
+        return;
+      }
+      state.processed += summary.processed;
+      state.skipped += summary.skipped;
+      state.verified += summary.verified;
+      state.probable += summary.probable;
+      state.manual += summary.manual;
+      state.blocked += summary.blocked;
+      state.errors += summary.errors;
+    }
+
+    assertBatchRunActive_(runId);
+    state.nextRow = scanRow;
+    if (!persistBatchStateIfActive_(state)) return;
+
+    updateSummarySheet_(ss);
+    assertBatchRunActive_(runId);
+
+    if (scanRow > lastRow) finishValidationBatch_(ss, state);
+    else scheduleValidatorContinuation_(runId);
+  } catch (error) {
+    if (isBatchStoppedError_(error)) {
+      deleteBatchStateIfRunMatches_(runId);
+      return;
+    }
+
+    // Run lama tidak boleh mematikan run baru yang mungkin sudah menggantikannya.
+    if (runId && !isBatchRunActive_(runId)) return;
+
+    const props = PropertiesService.getScriptProperties();
+    const message = getErrorMessage_(error);
+    props.setProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY, message);
+    clearBatchRunIfMatches_(runId);
+    deleteValidatorContinuationTriggers_();
+    throw error;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function stopEmailValidatorBatch() {
+  const props = PropertiesService.getScriptProperties();
+
+  // ACTIVE_RUN_ID dihapus terlebih dahulu. Batch yang sedang berada di tengah
+  // UrlFetch tidak bisa dibatalkan oleh Apps Script, tetapi saat request kembali
+  // ia akan melihat run sudah invalid dan tidak boleh menulis state/trigger lagi.
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.ACTIVE_RUN_ID_PROPERTY);
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY);
+  deleteValidatorContinuationTriggers_();
+  SpreadsheetApp.getActiveSpreadsheet().toast(
+    'Proses dihentikan. Batch aktif tidak akan dijadwalkan kembali.',
+    'Email Validator', 6
+  );
+}
+
+function showEmailValidatorStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+  if (!stateText) {
+    const lastError = props.getProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY);
+    SpreadsheetApp.getUi().alert(lastError
+      ? 'Tidak ada proses aktif. Error terakhir: ' + lastError
+      : 'Tidak ada proses batch yang sedang aktif.');
+    return;
+  }
+
+  const state = JSON.parse(stateText);
+  if (state.runId && !isBatchRunActive_(state.runId)) {
+    deleteBatchStateIfRunMatches_(state.runId);
+    deleteValidatorContinuationTriggers_();
+    SpreadsheetApp.getUi().alert('Proses sudah dihentikan; state lama dibersihkan.');
+    return;
+  }
+  const message = [
+    'Mode: ' + state.mode,
+    'Baris berikutnya: ' + state.nextRow,
+    'Batas akhir row: ' + (state.endRow || '-'),
+    'Diproses: ' + state.processed,
+    'Dilewati: ' + state.skipped,
+    'Terverifikasi: ' + state.verified,
+    'Kemungkinan valid: ' + state.probable,
+    'Cek manual: ' + state.manual,
+    'Jangan digunakan: ' + state.blocked,
+    'Error: ' + state.errors
+  ].join('\n');
+  SpreadsheetApp.getUi().alert('Status Email Validator', message, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function processExplicitValidationRows_(ss, sourceSheet, rows, forceEmailRefresh, runId) {
+  const sourceHeaderMap = getHeaderMap_(sourceSheet);
+  const companyCol = requireHeader_(sourceHeaderMap, 'Company Name');
+  const contactTypeCol = requireHeader_(sourceHeaderMap, 'Contact Type');
+  const contactCol = requireHeader_(sourceHeaderMap, 'Contact');
+
+  const rawSheet = ensureRawSheet_(ss);
+  const reviewSheet = ensureReviewSheet_(ss);
+  const evidenceSheet = ensureEvidenceSheet_(ss);
+  const companySheet = ensureCompanyMasterSheet_(ss);
+  const rawIndex = loadRawIndex_(rawSheet);
+  const reviewIndex = loadReviewIndex_(reviewSheet);
+  const evidenceIndex = loadReviewIndex_(evidenceSheet);
+  const companyIndex = loadCompanyMasterIndex_(companySheet);
+
+  const summary = {
+    processed: 0, skipped: 0, verified: 0, probable: 0,
+    manual: 0, blocked: 0, errors: 0, stopped: false
+  };
+
+  for (var i = 0; i < rows.length; i++) {
+    const sourceRow = rows[i];
+    try {
+      assertBatchRunActive_(runId);
+
+      const sourceValues = sourceSheet
+        .getRange(sourceRow, 1, 1, sourceSheet.getLastColumn())
+        .getDisplayValues()[0];
+      const companyName = cleanText_(sourceValues[companyCol - 1]);
+      const contactType = cleanText_(sourceValues[contactTypeCol - 1]).toUpperCase();
+      const email = normalizeEmail_(sourceValues[contactCol - 1]);
+
+      if (!companyName || contactType !== 'EMAIL' || !email) {
+        summary.skipped++;
+        continue;
+      }
+
+      const location = buildLocationText_(sourceValues, sourceHeaderMap);
+      const validationKey = makeValidationKey_(companyName, email);
+      var result;
+
+      const cached = rawIndex.byValidationKey[validationKey];
+      if (!forceEmailRefresh && isUsableEmailCache_(cached)) {
+        result = copyRawResult_(cached);
+        result.emailDataSource = 'EMAIL CACHE';
+        result.companyDataSource = 'COMPANY MASTER';
+        result.lastChecked = new Date();
+      } else {
+        result = validateEmailUsingCompanyMaster_(
+          companySheet, companyIndex, companyName, email, location, false, runId
+        );
+      }
+
+      // Hard-stop checkpoint setelah network/search selesai dan sebelum menulis sheet.
+      assertBatchRunActive_(runId);
+      upsertRawRow_(rawSheet, rawIndex, sourceRow, sourceValues, sourceHeaderMap, result);
+      assertBatchRunActive_(runId);
+      upsertReviewRow_(reviewSheet, reviewIndex, sourceRow, sourceValues, sourceHeaderMap, result);
+      assertBatchRunActive_(runId);
+      upsertEvidenceRow_(evidenceSheet, evidenceIndex, sourceRow, sourceValues, sourceHeaderMap, result);
+      summary.processed++;
+      incrementFriendlySummary_(summary, mapFinalStatus_(result.status));
+    } catch (error) {
+      if (isBatchStoppedError_(error)) {
+        summary.stopped = true;
+        break;
+      }
+      if (runId && !isBatchRunActive_(runId)) {
+        summary.stopped = true;
+        break;
+      }
+
+      const sourceValues = sourceSheet
+        .getRange(sourceRow, 1, 1, sourceSheet.getLastColumn())
+        .getDisplayValues()[0];
+      const email = normalizeEmail_(sourceValues[contactCol - 1]);
+      const result = emptyValidationResult_(email);
+      result.status = 'ERROR';
+      result.notes = getErrorMessage_(error);
+      result.emailDataSource = 'ERROR';
+      result.lastChecked = new Date();
+      upsertRawRow_(rawSheet, rawIndex, sourceRow, sourceValues, sourceHeaderMap, result);
+      upsertReviewRow_(reviewSheet, reviewIndex, sourceRow, sourceValues, sourceHeaderMap, result);
+      upsertEvidenceRow_(evidenceSheet, evidenceIndex, sourceRow, sourceValues, sourceHeaderMap, result);
+      summary.processed++;
+      summary.errors++;
+      summary.blocked++;
+    }
+
+    Utilities.sleep(EMAIL_VALIDATOR_CONFIG.REQUEST_DELAY_MS);
+  }
+
+  return summary;
+}
+
+function shouldProcessValidationRow_(sourceRow, rowValues, headerMap, rawIndex, mode) {
+  const company = cleanText_(rowValues[headerMap['Company Name'] - 1]);
+  const type = cleanText_(rowValues[headerMap['Contact Type'] - 1]).toUpperCase();
+  const email = normalizeEmail_(rowValues[headerMap['Contact'] - 1]);
+  if (!company || type !== 'EMAIL' || !email) return false;
+
+  const existing = rawIndex.rowsBySourceRow[String(sourceRow)];
+  if (!existing) return true;
+  if (!isCompatibleValidatorVersion_(existing.validatorVersion)) return true;
+
+  const technicalStatus = cleanText_(existing.status).toUpperCase();
+  if (mode === 'RETRY') {
+    return /NOT_PUBLICLY_VERIFIED|REVIEW_REQUIRED|MISMATCH_SUSPECTED|INVALID|ERROR/.test(technicalStatus);
+  }
+  return !technicalStatus || technicalStatus === 'PROCESSING';
+}
+
+function validateEmailUsingCompanyMaster_(companySheet, companyIndex, companyName, email, location, forceCompanyRefresh, runId) {
+  const result = emptyValidationResult_(email);
+  result.lastChecked = new Date();
+  result.validatorVersion = EMAIL_VALIDATOR_CONFIG.VERSION;
+
+  result.formatValid = isValidEmailFormat_(email);
+  if (!result.formatValid) {
+    result.status = 'INVALID_FORMAT';
+    result.notes = 'Format alamat email tidak valid.';
+    result.emailDataSource = 'FORMAT CHECK';
+    return result;
+  }
+
+  result.emailDomain = email.split('@')[1].toLowerCase();
+  const freeEmail = isFreeEmailDomain_(result.emailDomain);
+  assertBatchRunActive_(runId);
+  const mx = lookupMx_(result.emailDomain, runId);
+  assertBatchRunActive_(runId);
+  result.hasMx = mx.hasMx;
+  if (!result.hasMx) {
+    result.status = 'INVALID_DOMAIN';
+    result.score = 10;
+    result.notes = 'Domain email tidak memiliki MX yang terbaca.';
+    result.emailDataSource = 'MX CHECK';
+    return result;
+  }
+
+  const companyData = getOrFindCompanyPresence_(
+    companySheet, companyIndex, companyName, location, forceCompanyRefresh, runId
+  );
+  const presence = companyData.presence;
+  result.companyDataSource = companyData.source;
+  result.officialWebsite = presence.website.url;
+  result.websiteMatch = presence.website.status;
+  result.officialDomain = presence.website.status === 'MATCH' ? presence.website.domain : '';
+  result.linkedinUrl = presence.linkedin.url;
+  result.linkedinMatch = presence.linkedin.status;
+  result.instagramUrl = presence.instagram.url;
+  result.instagramMatch = presence.instagram.status;
+  result.ahuStatus = presence.ahu ? (presence.ahu.status || 'NOT_FOUND') : 'NOT_FOUND';
+  result.ahuRegisteredName = presence.ahu ? (presence.ahu.registeredName || '') : '';
+  result.ahuEvidence = presence.ahu ? (presence.ahu.evidenceUrl || '') : '';
+  result.presenceScore = presence.score;
+  result.presenceStatus = presence.status;
+  result.domainMatch = Boolean(
+    result.officialDomain && sameRegistrableDomain_(result.emailDomain, result.officialDomain)
+  );
+
+  assertBatchRunActive_(runId);
+  const exactResults = openAIWebSearch_('\"' + email + '\"', runId);
+  const evidence = findEmailEvidence_(exactResults, companyName, email, presence, runId);
+  result.emailDataSource = 'OPENAI WEB SEARCH';
+  result.exactEmailFound = evidence.exactFound;
+  result.evidenceType = evidence.type;
+  result.evidenceSource = evidence.sourceUrl;
+  result.emailOnWebsite = evidence.channels.website.found;
+  result.websiteEvidence = evidence.channels.website.sourceUrl;
+  result.emailOnLinkedin = evidence.channels.linkedin.found;
+  result.linkedinEvidence = evidence.channels.linkedin.sourceUrl;
+  result.emailOnInstagram = evidence.channels.instagram.found;
+  result.instagramEvidence = evidence.channels.instagram.sourceUrl;
+  result.otherEmailEvidence = evidence.channels.other.sourceUrl;
+  result.companyMatched = evidence.companyMatched;
+  result.otherCompanySuspected = evidence.otherCompanySuspected;
+
+  var score = 35; // format + MX
+  if (result.domainMatch) score += 25;
+  if (evidence.exactFound) score += 20;
+  if (evidence.companyMatched) score += 20;
+  if (evidence.type === 'OFFICIAL_WEBSITE') score += 15;
+  if (/^OFFICIAL_(LINKEDIN|INSTAGRAM)$/.test(evidence.type) || evidence.type === 'OTHER_OFFICIAL_SOCIAL') score += 10;
+  if (evidence.type === 'THIRD_PARTY_JOB_POST') score += 5;
+  if (freeEmail && !evidence.companyMatched) score -= 15;
+  if (evidence.otherCompanySuspected) score -= 40;
+  result.score = Math.max(0, Math.min(100, score));
+
+  if (evidence.otherCompanySuspected && !evidence.companyMatched) {
+    result.status = 'MISMATCH_SUSPECTED';
+    result.notes = 'Email ditemukan, tetapi mengarah ke perusahaan atau identitas lain.';
+  } else if (evidence.exactFound && evidence.companyMatched &&
+             (evidence.type === 'OFFICIAL_WEBSITE' ||
+              /^OFFICIAL_(LINKEDIN|INSTAGRAM)$/.test(evidence.type) ||
+              evidence.type === 'OTHER_OFFICIAL_SOCIAL')) {
+    result.status = 'VALID_HIGH';
+    result.notes = 'Email ditemukan pada kanal perusahaan yang cocok.';
+  } else if (evidence.exactFound && evidence.companyMatched) {
+    result.status = result.score >= 70 ? 'VALID_HIGH' : 'VALID_PROBABLE';
+    result.notes = 'Email ditemukan pada sumber publik yang menyebut perusahaan.';
+  } else if (!freeEmail && result.domainMatch) {
+    result.status = 'VALID_PROBABLE';
+    result.notes = 'Domain email cocok dengan website perusahaan dan MX aktif.';
+  } else if (freeEmail) {
+    result.status = 'NOT_PUBLICLY_VERIFIED';
+    result.notes = 'Email gratis belum ditemukan pada kanal perusahaan.';
+  } else {
+    result.status = 'REVIEW_REQUIRED';
+    result.notes = 'Hubungan email dengan perusahaan belum cukup kuat.';
+  }
+  return result;
+}
+
+function getOrFindCompanyPresence_(companySheet, companyIndex, companyName, location, forceRefresh, runId) {
+  const companyKey = makeCompanyKey_(companyName);
+  const cached = companyIndex.byKey[companyKey];
+
+  if (cached && cleanText_(cached.manualLock).toUpperCase() === 'YES') {
+    return { presence: companyItemToPresence_(cached), source: 'MANUAL COMPANY MASTER' };
+  }
+  if (!forceRefresh && isUsableCompanyCache_(cached)) {
+    return { presence: companyItemToPresence_(cached), source: 'COMPANY MASTER' };
+  }
+
+  assertBatchRunActive_(runId);
+  const searched = findCompanyPresence_(companyName, location, runId);
+  assertBatchRunActive_(runId);
+
+  var presence = searched;
+  var note = '';
+  const cachedFromLegacyProvider = cached && /BRAVE/.test(cleanText_(cached.dataSource).toUpperCase());
+  const cachedMissingAhu = cached && !cleanText_(cached.ahuStatus);
+
+  // Hanya refresh otomatis yang boleh mempertahankan hasil lama yang lebih kuat.
+  // Manual refresh harus bisa memperbaiki false-positive lama walaupun skor baru lebih rendah.
+  if (!forceRefresh && cached && !cachedFromLegacyProvider && !cachedMissingAhu &&
+      companyPresenceRank_(cached.status) > companyPresenceRank_(searched.status)) {
+    presence = companyItemToPresence_(cached);
+    note = 'Hasil refresh otomatis lebih lemah; data lama dipertahankan.';
+  } else if (forceRefresh && cached) {
+    note = 'Manual refresh: data lama diganti dengan hasil pencarian terbaru.';
+  } else if (cachedFromLegacyProvider) {
+    note = 'Data Brave lama diganti dengan hasil OpenAI Web Search.';
+  } else if (cachedMissingAhu) {
+    note = 'Company Master lama dilengkapi dengan AHU engine dan social matcher terbaru.';
+  }
+
+  assertBatchRunActive_(runId);
+  upsertCompanyMaster_(companySheet, companyIndex, companyKey, companyName, location,
+    presence, 'OPENAI WEB SEARCH + AHU', note);
+  return { presence: presence, source: 'OPENAI WEB SEARCH + AHU' };
+}
+
+function refreshSelectedCompanies() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+  if (sheet.getName() !== EMAIL_VALIDATOR_CONFIG.COMPANY_SHEET_NAME) {
+    SpreadsheetApp.getUi().alert('Buka sheet "Company Master" lalu pilih baris perusahaan yang ingin di-refresh.');
+    return;
+  }
+  assertValidatorApiKey_();
+
+  const range = sheet.getActiveRange();
+  if (!range) return;
+  const index = loadCompanyMasterIndex_(sheet);
+  const headerMap = getHeaderMap_(sheet);
+  var refreshed = 0;
+  var skipped = 0;
+
+  for (var row = Math.max(2, range.getRow()); row <= range.getLastRow(); row++) {
+    const companyName = cleanText_(sheet.getRange(row, headerMap['Company Name']).getDisplayValue());
+    const location = cleanText_(sheet.getRange(row, headerMap['Location']).getDisplayValue());
+    const manualLock = cleanText_(sheet.getRange(row, headerMap['Manual Lock']).getDisplayValue()).toUpperCase();
+    if (!companyName || manualLock === 'YES') {
+      skipped++;
+      continue;
+    }
+    getOrFindCompanyPresence_(sheet, index, companyName, location, true);
+    refreshed++;
+    Utilities.sleep(EMAIL_VALIDATOR_CONFIG.REQUEST_DELAY_MS);
+  }
+  updateSummarySheet_(ss);
+  ss.toast(refreshed + ' perusahaan di-refresh, ' + skipped + ' dilewati.', 'Email Validator', 8);
+}
+
+function migrateLegacyValidationResults() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const legacy = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.LEGACY_SHEET_NAME);
+  const sourceSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.JOB_SHEET_NAME);
+  if (!legacy) {
+    SpreadsheetApp.getUi().alert('Sheet "Email Validation Result" tidak ditemukan.');
+    return;
+  }
+  if (!sourceSheet) throw new Error('Sheet "Job Board" tidak ditemukan.');
+
+  ensureWorkspace_(ss);
+  const legacyMap = getHeaderMap_(legacy);
+  const sourceMap = getHeaderMap_(sourceSheet);
+  const rawSheet = ensureRawSheet_(ss);
+  const reviewSheet = ensureReviewSheet_(ss);
+  const evidenceSheet = ensureEvidenceSheet_(ss);
+  const companySheet = ensureCompanyMasterSheet_(ss);
+  const rawIndex = loadRawIndex_(rawSheet);
+  const reviewIndex = loadReviewIndex_(reviewSheet);
+  const evidenceIndex = loadReviewIndex_(evidenceSheet);
+  const companyIndex = loadCompanyMasterIndex_(companySheet);
+
+  if (legacy.getLastRow() < 2) {
+    SpreadsheetApp.getUi().alert('Tidak ada data lama untuk dimigrasikan.');
+    return;
+  }
+
+  const rows = legacy.getRange(2, 1, legacy.getLastRow() - 1, legacy.getLastColumn()).getValues();
+  var migrated = 0;
+  rows.forEach(function (legacyRow) {
+    const sourceRow = Number(readMapped_(legacyRow, legacyMap, 'Source Row'));
+    if (!sourceRow || sourceRow < 2 || sourceRow > sourceSheet.getLastRow()) return;
+
+    const sourceValues = sourceSheet.getRange(sourceRow, 1, 1, sourceSheet.getLastColumn()).getDisplayValues()[0];
+    const companyName = cleanText_(sourceValues[sourceMap['Company Name'] - 1]);
+    const location = buildLocationText_(sourceValues, sourceMap);
+    const result = legacyRowToResult_(legacyRow, legacyMap);
+    result.validatorVersion = EMAIL_VALIDATOR_CONFIG.VERSION;
+    result.companyDataSource = 'MIGRATED';
+    result.emailDataSource = 'MIGRATED';
+
+    const presence = resultToPresence_(result);
+    const companyKey = makeCompanyKey_(companyName);
+    upsertCompanyMaster_(companySheet, companyIndex, companyKey, companyName, location, presence, 'MIGRATED', 'Dibuat dari hasil validator v2.1.');
+    upsertRawRow_(rawSheet, rawIndex, sourceRow, sourceValues, sourceMap, result);
+    upsertReviewRow_(reviewSheet, reviewIndex, sourceRow, sourceValues, sourceMap, result);
+    upsertEvidenceRow_(evidenceSheet, evidenceIndex, sourceRow, sourceValues, sourceMap, result);
+    migrated++;
+  });
+
+  updateSummarySheet_(ss);
+  ss.setActiveSheet(reviewSheet);
+  SpreadsheetApp.getUi().alert(
+    'Migrasi selesai',
+    migrated + ' baris dipindahkan tanpa pencarian web baru.\nData perusahaan juga dimasukkan ke Company Master.',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+function rebuildReviewFromRaw() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const rawSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.RAW_SHEET_NAME);
+  const sourceSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.JOB_SHEET_NAME);
+  if (!rawSheet || !sourceSheet) {
+    SpreadsheetApp.getUi().alert('Sheet Raw atau Job Board belum tersedia.');
+    return;
+  }
+
+  const rebuilt = rebuildViewsFromRaw_(ss);
+  updateSummarySheet_(ss);
+  ss.setActiveSheet(ensureReviewSheet_(ss));
+  ss.toast(rebuilt + ' baris Review + Evidence berhasil dibangun ulang tanpa web search.', 'Email Validator', 7);
+}
+
+function rebuildViewsFromRaw_(ss) {
+  const sourceSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.JOB_SHEET_NAME);
+  if (!ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.RAW_SHEET_NAME) || !sourceSheet) return 0;
+  const rawSheet = ensureRawSheet_(ss);
+
+  archiveLegacyReviewSheet_(ss);
+  const reviewSheet = ensureReviewSheet_(ss);
+  const evidenceSheet = ensureEvidenceSheet_(ss);
+
+  clearSheetDataRows_(reviewSheet);
+  clearSheetDataRows_(evidenceSheet);
+
+  const reviewIndex = loadReviewIndex_(reviewSheet);
+  const evidenceIndex = loadReviewIndex_(evidenceSheet);
+  const rawMap = getHeaderMap_(rawSheet);
+  const sourceMap = getHeaderMap_(sourceSheet);
+  const rows = rawSheet.getLastRow() > 1
+    ? rawSheet.getRange(2, 1, rawSheet.getLastRow() - 1, rawSheet.getLastColumn()).getValues()
+    : [];
+
+  var rebuilt = 0;
+  rows.forEach(function (rawRow) {
+    const sourceRow = Number(readMapped_(rawRow, rawMap, 'Source Row'));
+    if (!sourceRow || sourceRow > sourceSheet.getLastRow()) return;
+    const sourceValues = sourceSheet.getRange(sourceRow, 1, 1, sourceSheet.getLastColumn()).getDisplayValues()[0];
+    const result = rawRowToResult_(rawRow, rawMap);
+    upsertReviewRow_(reviewSheet, reviewIndex, sourceRow, sourceValues, sourceMap, result);
+    upsertEvidenceRow_(evidenceSheet, evidenceIndex, sourceRow, sourceValues, sourceMap, result);
+    rebuilt++;
+  });
+  return rebuilt;
+}
+
+function clearSheetDataRows_(sheet) {
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent().setBackground('#ffffff');
+  }
+}
+
+function ensureWorkspace_(ss) {
+  archiveLegacyReviewSheet_(ss);
+  ensureReviewSheet_(ss);
+  ensureEvidenceSheet_(ss);
+  ensureCompanyMasterSheet_(ss);
+  ensureRawSheet_(ss);
+  ensureSummarySheet_(ss);
+}
+
+function archiveLegacyReviewSheet_(ss) {
+  const legacy = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.LEGACY_REVIEW_SHEET_NAME);
+  if (!legacy) return;
+
+  const archiveName = EMAIL_VALIDATOR_CONFIG.LEGACY_REVIEW_ARCHIVE_SHEET_NAME;
+  const existingArchive = ss.getSheetByName(archiveName);
+  if (!existingArchive) {
+    try { legacy.setName(archiveName); } catch (error) { console.warn(getErrorMessage_(error)); }
+    const renamed = ss.getSheetByName(archiveName) || legacy;
+    try { renamed.hideSheet(); } catch (error) { console.warn(getErrorMessage_(error)); }
+    return;
+  }
+
+  // Jika archive sudah ada, sheet lama tetap dipertahankan tetapi disembunyikan.
+  try { legacy.hideSheet(); } catch (error) { console.warn(getErrorMessage_(error)); }
+}
+
+function ensureReviewSheet_(ss) {
+  var sheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.REVIEW_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(EMAIL_VALIDATOR_CONFIG.REVIEW_SHEET_NAME);
+  ensureHeaders_(sheet, EMAIL_VALIDATOR_CONFIG.REVIEW_HEADERS);
+
+  const map = getHeaderMap_(sheet);
+  const lastCol = sheet.getLastColumn();
+  sheet.getRange(1, 1, 1, lastCol)
+    .setFontColor('#ffffff').setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
+
+  paintHeaderGroup_(sheet, map, ['Source Row', 'No', 'Team', 'Position', 'Company Name', 'Email'], '#1f4e78');
+  paintHeaderGroup_(sheet, map, ['Final Status', 'Recommended Action'], '#7030a0');
+  paintHeaderGroup_(sheet, map, ['Email Format', 'Domain MX', 'Domain Match', 'Exact Email Found'], '#c65911');
+  paintHeaderGroup_(sheet, map, ['Company Presence Status', 'Validation Score'], '#548235');
+  paintHeaderGroup_(sheet, map, ['Evidence Type', 'Validation Notes', 'Last Checked'], '#595959');
+
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(6);
+  sheet.setTabColor('#2f75b5');
+  if (map['Source Row']) sheet.hideColumns(map['Source Row']);
+
+  const widthByHeader = {
+    'Source Row': 70,
+    'No': 55,
+    'Team': 100,
+    'Position': 200,
+    'Company Name': 190,
+    'Email': 220,
+    'Final Status': 150,
+    'Recommended Action': 160,
+    'Email Format': 95,
+    'Domain MX': 95,
+    'Domain Match': 105,
+    'Exact Email Found': 120,
+    'Company Presence Status': 150,
+    'Validation Score': 105,
+    'Evidence Type': 145,
+    'Validation Notes': 330,
+    'Last Checked': 130
+  };
+  Object.keys(widthByHeader).forEach(function (header) {
+    if (map[header]) sheet.setColumnWidth(map[header], widthByHeader[header]);
+  });
+
+  const dataRows = Math.max(sheet.getMaxRows() - 1, 1);
+  if (map['Validation Notes']) sheet.getRange(2, map['Validation Notes'], dataRows, 1).setWrap(true);
+  if (map['Last Checked']) sheet.getRange(2, map['Last Checked'], dataRows, 1).setNumberFormat('dd/MM/yyyy HH:mm');
+  if (map['Validation Score']) sheet.getRange(2, map['Validation Score'], dataRows, 1).setNumberFormat('0');
+
+  if (!sheet.getFilter() && sheet.getMaxRows() > 1) {
+    try { sheet.getRange(1, 1, sheet.getMaxRows(), lastCol).createFilter(); } catch (error) { console.warn(getErrorMessage_(error)); }
+  }
+  return sheet;
+}
+
+function ensureEvidenceSheet_(ss) {
+  var sheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.EVIDENCE_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(EMAIL_VALIDATOR_CONFIG.EVIDENCE_SHEET_NAME);
+  ensureHeaders_(sheet, EMAIL_VALIDATOR_CONFIG.EVIDENCE_HEADERS);
+
+  const map = getHeaderMap_(sheet);
+  const lastCol = sheet.getLastColumn();
+  sheet.getRange(1, 1, 1, lastCol)
+    .setFontColor('#ffffff').setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
+
+  paintHeaderGroup_(sheet, map, ['Source Row', 'Company Name', 'Email', 'Final Status'], '#1f4e78');
+  paintHeaderGroup_(sheet, map, ['Official Website', 'Website Match', 'Email on Website', 'Website Evidence'], '#548235');
+  paintHeaderGroup_(sheet, map, ['LinkedIn Company', 'LinkedIn Match', 'Email on LinkedIn', 'LinkedIn Evidence'], '#2f75b5');
+  paintHeaderGroup_(sheet, map, ['Instagram', 'Instagram Match', 'Email on Instagram', 'Instagram Evidence'], '#c2185b');
+  paintHeaderGroup_(sheet, map, ['AHU Status', 'AHU Registered Name', 'AHU Evidence'], '#00838f');
+  paintHeaderGroup_(sheet, map, ['Other Email Evidence'], '#595959');
+
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(4);
+  sheet.setTabColor('#8064a2');
+  if (map['Source Row']) sheet.hideColumns(map['Source Row']);
+
+  const widthByHeader = {
+    'Source Row': 70,
+    'Company Name': 190,
+    'Email': 220,
+    'Final Status': 150,
+    'Official Website': 135,
+    'Website Match': 110,
+    'Email on Website': 115,
+    'Website Evidence': 130,
+    'LinkedIn Company': 135,
+    'LinkedIn Match': 110,
+    'Email on LinkedIn': 115,
+    'LinkedIn Evidence': 130,
+    'Instagram': 135,
+    'Instagram Match': 110,
+    'Email on Instagram': 115,
+    'Instagram Evidence': 130,
+    'AHU Status': 110,
+    'AHU Registered Name': 220,
+    'AHU Evidence': 130,
+    'Other Email Evidence': 150
+  };
+  Object.keys(widthByHeader).forEach(function (header) {
+    if (map[header]) sheet.setColumnWidth(map[header], widthByHeader[header]);
+  });
+
+  const dataRows = Math.max(sheet.getMaxRows() - 1, 1);
+  ['AHU Registered Name'].forEach(function (header) {
+    if (map[header]) sheet.getRange(2, map[header], dataRows, 1).setWrap(true);
+  });
+
+  if (!sheet.getFilter() && sheet.getMaxRows() > 1) {
+    try { sheet.getRange(1, 1, sheet.getMaxRows(), lastCol).createFilter(); } catch (error) { console.warn(getErrorMessage_(error)); }
+  }
+  return sheet;
+}
+
+function paintHeaderGroup_(sheet, map, headers, background) {
+  headers.forEach(function (header) {
+    if (map[header]) sheet.getRange(1, map[header]).setBackground(background);
+  });
+}
+
+function ensureCompanyMasterSheet_(ss) {
+  var sheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.COMPANY_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(EMAIL_VALIDATOR_CONFIG.COMPANY_SHEET_NAME);
+  ensureHeaders_(sheet, EMAIL_VALIDATOR_CONFIG.COMPANY_HEADERS);
+
+  const map = getHeaderMap_(sheet);
+  sheet.getRange(1, 1, 1, sheet.getLastColumn())
+    .setBackground('#375623').setFontColor('#ffffff').setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(2);
+  sheet.setTabColor('#70ad47');
+  if (map['Company Key']) sheet.hideColumns(map['Company Key']);
+
+  const widthByHeader = {
+    'Company Key': 170,
+    'Company Name': 190,
+    'Location': 180,
+    'Official Website': 240,
+    'Official Domain': 150,
+    'LinkedIn': 260,
+    'Instagram': 220,
+    'AHU Status': 110,
+    'AHU Registered Name': 230,
+    'AHU Evidence': 260,
+    'Company Status': 135,
+    'Data Source': 140,
+    'Last Checked': 125,
+    'Manual Lock': 95,
+    'Notes': 280
+  };
+  Object.keys(widthByHeader).forEach(function (header) {
+    if (map[header]) sheet.setColumnWidth(map[header], widthByHeader[header]);
+  });
+
+  const dataRows = Math.max(sheet.getMaxRows() - 1, 1);
+  if (map['Last Checked']) {
+    sheet.getRange(2, map['Last Checked'], dataRows, 1).setNumberFormat('dd/MM/yyyy HH:mm');
+  }
+  if (map['Manual Lock']) {
+    sheet.getRange(2, map['Manual Lock'], dataRows, 1).setDataValidation(
+      SpreadsheetApp.newDataValidation().requireValueInList(['NO', 'YES'], true).setAllowInvalid(false).build()
+    );
+  }
+  ['AHU Registered Name', 'AHU Evidence', 'Notes'].forEach(function (header) {
+    if (map[header]) sheet.getRange(2, map[header], dataRows, 1).setWrap(true);
+  });
+  return sheet;
+}
+
+function ensureRawSheet_(ss) {
+  var sheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.RAW_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(EMAIL_VALIDATOR_CONFIG.RAW_SHEET_NAME);
+  ensureHeaders_(sheet, EMAIL_VALIDATOR_CONFIG.RAW_HEADERS);
+  const map = getHeaderMap_(sheet);
+  sheet.getRange(1, 1, 1, sheet.getLastColumn())
+    .setBackground('#595959').setFontColor('#ffffff').setFontWeight('bold').setWrap(true);
+  sheet.setFrozenRows(1);
+  if (map['Last Checked']) {
+    sheet.getRange(2, map['Last Checked'], Math.max(sheet.getMaxRows() - 1, 1), 1)
+      .setNumberFormat('dd/MM/yyyy HH:mm');
+  }
+  sheet.setTabColor('#a5a5a5');
+  try { sheet.hideSheet(); } catch (error) { console.warn(getErrorMessage_(error)); }
+  return sheet;
+}
+
+function ensureSummarySheet_(ss) {
+  var sheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.SUMMARY_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(EMAIL_VALIDATOR_CONFIG.SUMMARY_SHEET_NAME, 0);
+  sheet.setTabColor('#ffc000');
+  return sheet;
+}
+
+function ensureHeaders_(sheet, headers) {
+  const map = getHeaderMap_(sheet);
+  var lastColumn = Math.max(sheet.getLastColumn(), 0);
+  headers.forEach(function (header) {
+    if (!map[header]) {
+      lastColumn++;
+      sheet.getRange(1, lastColumn).setValue(header);
+      map[header] = lastColumn;
+    }
+  });
+}
+
+function updateSummarySheet_(ss) {
+  const sheet = ensureSummarySheet_(ss);
+  const review = ensureReviewSheet_(ss);
+  const company = ensureCompanyMasterSheet_(ss);
+  const reviewMap = getHeaderMap_(review);
+  const rows = review.getLastRow() > 1
+    ? review.getRange(2, 1, review.getLastRow() - 1, review.getLastColumn()).getDisplayValues()
+    : [];
+
+  const counts = { 'TERVERIFIKASI': 0, 'KEMUNGKINAN VALID': 0, 'CEK MANUAL': 0, 'JANGAN DIGUNAKAN': 0 };
+  const companies = {};
+  const emails = {};
+  rows.forEach(function (row) {
+    const status = cleanText_(row[reviewMap['Final Status'] - 1]).toUpperCase();
+    if (counts.hasOwnProperty(status)) counts[status]++;
+    const companyName = normalizeCompanyKey_(row[reviewMap['Company Name'] - 1]);
+    const email = normalizeEmail_(row[reviewMap['Email'] - 1]);
+    if (companyName) companies[companyName] = true;
+    if (email) emails[email] = true;
+  });
+
+  try { sheet.getDataRange().breakApart(); } catch (error) { console.warn(getErrorMessage_(error)); }
+  sheet.clear();
+  sheet.getRange('A1:F1').merge().setValue('RINGKASAN VALIDASI EMAIL')
+    .setBackground('#1f4e78').setFontColor('#ffffff').setFontWeight('bold')
+    .setFontSize(16).setHorizontalAlignment('center').setVerticalAlignment('middle');
+  sheet.setRowHeight(1, 36);
+  sheet.getRange('A2:F2').merge().setValue('Terakhir diperbarui: ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm'))
+    .setFontColor('#666666').setHorizontalAlignment('center');
+
+  const labels = [['Baris Dicek', 'Email Unik', 'Perusahaan', 'Terverifikasi', 'Kemungkinan Valid', 'Perlu Tindakan']];
+  const values = [[rows.length, Object.keys(emails).length, Object.keys(companies).length,
+    counts['TERVERIFIKASI'], counts['KEMUNGKINAN VALID'], counts['CEK MANUAL'] + counts['JANGAN DIGUNAKAN']]];
+  sheet.getRange('A4:F4').setValues(labels).setFontWeight('bold').setHorizontalAlignment('center').setBackground('#d9eaf7');
+  sheet.getRange('A5:F5').setValues(values).setFontWeight('bold').setFontSize(16).setHorizontalAlignment('center');
+
+  sheet.getRange('A8:D8').setValues([['Status', 'Arti', 'Tindakan', 'Warna']])
+    .setBackground('#1f4e78').setFontColor('#ffffff').setFontWeight('bold');
+  const guide = [
+    ['TERVERIFIKASI', 'Email memiliki bukti publik yang cocok', 'Bisa digunakan', 'Hijau'],
+    ['KEMUNGKINAN VALID', 'Domain cocok atau bukti cukup kuat', 'Bisa dicoba dengan hati-hati', 'Hijau muda'],
+    ['CEK MANUAL', 'Hubungan email belum cukup kuat', 'Buka sumber bukti dan cek ulang', 'Kuning'],
+    ['JANGAN DIGUNAKAN', 'Format/domain salah, mismatch, atau error', 'Hindari sampai diperbaiki', 'Merah']
+  ];
+  sheet.getRange(9, 1, guide.length, 4).setValues(guide).setWrap(true);
+  sheet.getRange('A9:A9').setBackground('#b7e1cd');
+  sheet.getRange('A10:A10').setBackground('#d9ead3');
+  sheet.getRange('A11:A11').setBackground('#fff2cc');
+  sheet.getRange('A12:A12').setBackground('#f4cccc');
+
+  sheet.getRange('A15:D15').setValues([['Database', 'Jumlah', 'Masa Cache', 'Keterangan']])
+    .setBackground('#375623').setFontColor('#ffffff').setFontWeight('bold');
+  sheet.getRange('A16:D17').setValues([
+    ['Company Master', Math.max(company.getLastRow() - 1, 0), EMAIL_VALIDATOR_CONFIG.COMPANY_CACHE_MAX_AGE_DAYS + ' hari', 'Perusahaan sama tidak dicari ulang'],
+    ['Email Cache', Object.keys(emails).length, EMAIL_VALIDATOR_CONFIG.EMAIL_CACHE_MAX_AGE_DAYS + ' hari', 'Perusahaan + email sama tidak divalidasi ulang']
+  ]).setWrap(true);
+
+  sheet.getRange('A20:D20').setValues([['Tampilan', 'Dipakai untuk', 'Frekuensi', 'Catatan']])
+    .setBackground('#7030a0').setFontColor('#ffffff').setFontWeight('bold');
+  sheet.getRange('A21:D24').setValues([
+    ['Email Review', 'Keputusan cepat: email aman dipakai atau tidak', 'Utama', '16 kolom visible'],
+    ['Email Evidence', 'Investigasi Website / LinkedIn / Instagram / AHU', 'Saat perlu cek', 'URL tampil sebagai label hyperlink'],
+    ['Company Master', 'Identitas perusahaan dan cache presence', 'Sesekali', 'Bisa Manual Lock'],
+    ['Email Validation Raw', 'Audit trail teknis lengkap', 'Jarang', 'Hidden secara default']
+  ]).setWrap(true);
+
+  [120, 170, 160, 220, 145, 145].forEach(function (w, i) { sheet.setColumnWidth(i + 1, w); });
+  sheet.setFrozenRows(2);
+}
+
+function loadReviewIndex_(sheet) {
+  const index = { bySourceRow: {} };
+  if (sheet.getLastRow() < 2) return index;
+  const map = getHeaderMap_(sheet);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getDisplayValues();
+  rows.forEach(function (row, offset) {
+    const sourceRow = cleanText_(row[map['Source Row'] - 1]);
+    if (sourceRow) index.bySourceRow[sourceRow] = offset + 2;
+  });
+  return index;
+}
+
+function upsertReviewRow_(sheet, index, sourceRow, sourceValues, sourceMap, result) {
+  const map = getHeaderMap_(sheet);
+  const rowKey = String(sourceRow);
+  const outputRow = index.bySourceRow[rowKey] || sheet.getLastRow() + 1;
+  const finalStatus = mapFinalStatus_(result.status);
+  const evidenceUrl = bestEvidenceSource_(result);
+  const evidenceLabel = evidenceDisplayLabel_(result.evidenceType) ||
+    (result.officialWebsite ? '🌐 Website' :
+      (result.linkedinUrl ? 'in LinkedIn' :
+        (result.instagramUrl ? '📷 Instagram' : (evidenceUrl ? '🔎 Evidence' : ''))));
+  const values = {
+    'Source Row': sourceRow,
+    'No': sourceMap['No'] ? sourceValues[sourceMap['No'] - 1] : '',
+    'Team': sourceMap['Team'] ? sourceValues[sourceMap['Team'] - 1] : '',
+    'Position': sourceMap['Position'] ? sourceValues[sourceMap['Position'] - 1] : '',
+    'Company Name': sourceMap['Company Name'] ? sourceValues[sourceMap['Company Name'] - 1] : '',
+    'Email': result.email || '',
+    'Final Status': finalStatus,
+    'Recommended Action': recommendedAction_(finalStatus),
+    'Email Format': result.formatValid === true ? 'VALID' : (result.formatValid === false ? 'INVALID' : ''),
+    'Domain MX': result.hasMx === true ? 'ACTIVE' : (result.hasMx === false ? 'NO_MX' : ''),
+    'Domain Match': result.domainMatch === true ? 'MATCH' : (result.domainMatch === false ? 'NO_MATCH' : ''),
+    'Exact Email Found': result.exactEmailFound === true ? 'FOUND' : (result.exactEmailFound === false ? 'NOT_FOUND' : ''),
+    'Company Presence Status': friendlyCompanyStatus_(result.presenceStatus),
+    'Validation Score': Number(result.score || 0),
+    'Evidence Type': evidenceLabel,
+    'Validation Notes': result.notes || '',
+    'Last Checked': result.lastChecked || new Date()
+  };
+
+  Object.keys(values).forEach(function (header) {
+    if (map[header]) sheet.getRange(outputRow, map[header]).setValue(values[header]);
+  });
+
+  if (map['Evidence Type'] && evidenceUrl) {
+    setLabeledHyperlink_(sheet.getRange(outputRow, map['Evidence Type']), evidenceLabel || '🔎 Evidence', evidenceUrl);
+  }
+
+  applyReviewStatusColor_(sheet, outputRow, map, finalStatus);
+  applyEvidenceCellColors_(sheet, outputRow, map, values);
+  applyCompanyPresenceColor_(sheet, outputRow, map, values['Company Presence Status']);
+  if (map['Validation Score']) sheet.getRange(outputRow, map['Validation Score']).setHorizontalAlignment('center');
+  index.bySourceRow[rowKey] = outputRow;
+}
+
+function upsertEvidenceRow_(sheet, index, sourceRow, sourceValues, sourceMap, result) {
+  const map = getHeaderMap_(sheet);
+  const rowKey = String(sourceRow);
+  const outputRow = index.bySourceRow[rowKey] || sheet.getLastRow() + 1;
+  const finalStatus = mapFinalStatus_(result.status);
+  const values = {
+    'Source Row': sourceRow,
+    'Company Name': sourceMap['Company Name'] ? sourceValues[sourceMap['Company Name'] - 1] : '',
+    'Email': result.email || '',
+    'Final Status': finalStatus,
+    'Official Website': result.officialWebsite ? '🌐 Website' : '',
+    'Website Match': result.websiteMatch || '',
+    'Email on Website': evidenceFlag_(result.emailOnWebsite),
+    'Website Evidence': result.websiteEvidence ? '🔎 Evidence' : '',
+    'LinkedIn Company': result.linkedinUrl ? 'in LinkedIn' : '',
+    'LinkedIn Match': result.linkedinMatch || '',
+    'Email on LinkedIn': evidenceFlag_(result.emailOnLinkedin),
+    'LinkedIn Evidence': result.linkedinEvidence ? '🔎 Evidence' : '',
+    'Instagram': result.instagramUrl ? '📷 Instagram' : '',
+    'Instagram Match': result.instagramMatch || '',
+    'Email on Instagram': evidenceFlag_(result.emailOnInstagram),
+    'Instagram Evidence': result.instagramEvidence ? '🔎 Evidence' : '',
+    'AHU Status': result.ahuStatus || '',
+    'AHU Registered Name': result.ahuRegisteredName || '',
+    'AHU Evidence': result.ahuEvidence ? '🏛️ AHU Evidence' : '',
+    'Other Email Evidence': result.otherEmailEvidence ? '🔎 Other Evidence' : ''
+  };
+
+  Object.keys(values).forEach(function (header) {
+    if (map[header]) sheet.getRange(outputRow, map[header]).setValue(values[header]);
+  });
+
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Official Website', '🌐 Website', result.officialWebsite);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Website Evidence', '🔎 Evidence', result.websiteEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'LinkedIn Company', 'in LinkedIn', result.linkedinUrl);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'LinkedIn Evidence', '🔎 Evidence', result.linkedinEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Instagram', '📷 Instagram', result.instagramUrl);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Instagram Evidence', '🔎 Evidence', result.instagramEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'AHU Evidence', '🏛️ AHU Evidence', result.ahuEvidence);
+  setEvidenceLinkIfPresent_(sheet, outputRow, map, 'Other Email Evidence', '🔎 Other Evidence', result.otherEmailEvidence);
+
+  applyReviewStatusColor_(sheet, outputRow, map, finalStatus);
+  applyEvidenceCellColors_(sheet, outputRow, map, values);
+  index.bySourceRow[rowKey] = outputRow;
+}
+
+function setEvidenceLinkIfPresent_(sheet, row, map, header, label, url) {
+  if (!map[header] || !url) return;
+  setLabeledHyperlink_(sheet.getRange(row, map[header]), label, url);
+}
+
+function setLabeledHyperlink_(cell, label, url) {
+  const cleanUrl = cleanText_(url);
+  if (!cleanUrl) {
+    cell.setValue(label || '');
+    return;
+  }
+  try {
+    const rich = SpreadsheetApp.newRichTextValue()
+      .setText(label || '🔎 Evidence')
+      .setLinkUrl(cleanUrl)
+      .build();
+    cell.setRichTextValue(rich).setHorizontalAlignment('center');
+  } catch (error) {
+    cell.setValue(label || cleanUrl);
+  }
+}
+
+function evidenceDisplayLabel_(evidenceType) {
+  const type = cleanText_(evidenceType).toUpperCase();
+  if (type === 'OFFICIAL_WEBSITE') return '🌐 Website';
+  if (type === 'OFFICIAL_LINKEDIN' || type === 'LINKEDIN_SOURCE') return 'in LinkedIn';
+  if (type === 'OFFICIAL_INSTAGRAM' || type === 'INSTAGRAM_SOURCE') return '📷 Instagram';
+  if (type === 'OTHER_OFFICIAL_SOCIAL') return '👥 Social';
+  if (type === 'THIRD_PARTY_JOB_POST') return '💼 Job Post';
+  if (type) return '🔎 Evidence';
+  return '';
+}
+
+function applyCompanyPresenceColor_(sheet, row, map, status) {
+  const col = map['Company Presence Status'];
+  if (!col) return;
+  const value = cleanText_(status).toUpperCase();
+  var color = '#eeeeee';
+  if (value === 'KUAT') color = '#b7e1cd';
+  else if (value === 'ADA') color = '#d9ead3';
+  else if (value === 'PERLU CEK') color = '#fff2cc';
+  sheet.getRange(row, col).setBackground(color).setFontWeight('bold').setHorizontalAlignment('center');
+}
+
+function evidenceFlag_(value) {
+  if (value === true) return 'FOUND';
+  if (value === false) return 'NOT_FOUND';
+  return '';
+}
+
+function parseEvidenceFlag_(value) {
+  const normalized = cleanText_(value).toUpperCase();
+  if (normalized === 'FOUND') return true;
+  if (normalized === 'NOT_FOUND') return false;
+  return null;
+}
+
+function booleanFlag_(value) {
+  if (value === true) return 'YES';
+  if (value === false) return 'NO';
+  return '';
+}
+
+function parseBooleanFlag_(value) {
+  const normalized = cleanText_(value).toUpperCase();
+  if (normalized === 'YES' || normalized === 'TRUE' || normalized === 'MATCH') return true;
+  if (normalized === 'NO' || normalized === 'FALSE' || normalized === 'NO_MATCH') return false;
+  return null;
+}
+
+function applyEvidenceCellColors_(sheet, row, map, values) {
+  ['Email Format', 'Domain MX', 'Domain Match', 'Exact Email Found',
+   'Website Match', 'Email on Website', 'LinkedIn Match', 'Email on LinkedIn',
+   'Instagram Match', 'Email on Instagram'].forEach(function (header) {
+    if (!map[header]) return;
+    const value = cleanText_(values[header]).toUpperCase();
+    var color = '#ffffff';
+    if (/VALID|ACTIVE|MATCH|FOUND|OFFICIAL_LINK/.test(value) && !/INVALID|NO_MATCH|NOT_FOUND/.test(value)) color = '#d9ead3';
+    else if (/INVALID|NO_MX|NO_MATCH/.test(value)) color = '#f4cccc';
+    else if (/NOT_FOUND|REVIEW/.test(value)) color = '#fff2cc';
+    sheet.getRange(row, map[header]).setBackground(color).setHorizontalAlignment('center');
+  });
+}
+
+function applyReviewStatusColor_(sheet, row, map, status) {
+  const col = map['Final Status'];
+  if (!col) return;
+  const cell = sheet.getRange(row, col);
+  const normalized = cleanText_(status).toUpperCase();
+  var background = '#ffffff';
+  var fontColor = '#000000';
+  if (normalized === 'TERVERIFIKASI') background = '#b7e1cd';
+  else if (normalized === 'KEMUNGKINAN VALID') background = '#d9ead3';
+  else if (normalized === 'CEK MANUAL') background = '#fff2cc';
+  else if (normalized === 'JANGAN DIGUNAKAN') {
+    background = '#f4cccc';
+    fontColor = '#9c0006';
+  }
+  cell.setBackground(background).setFontColor(fontColor).setFontWeight('bold').setHorizontalAlignment('center');
+}
+
+function mapFinalStatus_(technicalStatus) {
+  const status = cleanText_(technicalStatus).toUpperCase();
+  if (status === 'VALID_HIGH') return 'TERVERIFIKASI';
+  if (status === 'VALID_PROBABLE') return 'KEMUNGKINAN VALID';
+  if (/MISMATCH|INVALID|ERROR/.test(status)) return 'JANGAN DIGUNAKAN';
+  return 'CEK MANUAL';
+}
+
+function recommendedAction_(finalStatus) {
+  if (finalStatus === 'TERVERIFIKASI') return 'BISA DIGUNAKAN';
+  if (finalStatus === 'KEMUNGKINAN VALID') return 'BISA DICOBA';
+  if (finalStatus === 'JANGAN DIGUNAKAN') return 'HINDARI';
+  return 'CEK LINK / KONFIRMASI';
+}
+
+function companyProofLabel_(result) {
+  const channels = [];
+  if (result.websiteMatch === 'MATCH') channels.push('Website');
+  if (/MATCH|OFFICIAL_LINK/.test(result.linkedinMatch || '')) channels.push('LinkedIn');
+  if (/MATCH|OFFICIAL_LINK/.test(result.instagramMatch || '')) channels.push('Instagram');
+
+  var strength = 'TIDAK DITEMUKAN';
+  if (result.presenceStatus === 'VERIFIED_STRONG') strength = 'KUAT';
+  else if (result.presenceStatus === 'FOUND') strength = 'ADA';
+  else if (result.presenceStatus === 'REVIEW_REQUIRED') strength = 'PERLU CEK';
+  return channels.length ? strength + ' — ' + channels.join(' + ') : strength;
+}
+
+function bestEvidenceSource_(result) {
+  return result.evidenceSource || result.officialWebsite || result.linkedinUrl || result.instagramUrl || '';
+}
+
+function shortReason_(result, finalStatus) {
+  if (finalStatus === 'TERVERIFIKASI') return 'Email ditemukan pada sumber publik yang cocok dengan perusahaan.';
+  if (finalStatus === 'KEMUNGKINAN VALID') {
+    if (result.domainMatch) return 'Domain email cocok dengan website perusahaan dan MX aktif.';
+    return 'Bukti publik cukup kuat, tetapi alamat email belum sepenuhnya terkonfirmasi.';
+  }
+  if (finalStatus === 'JANGAN DIGUNAKAN') {
+    if (result.status === 'INVALID_FORMAT') return 'Format email tidak valid.';
+    if (result.status === 'INVALID_DOMAIN') return 'Domain email tidak memiliki MX.';
+    if (result.status === 'MISMATCH_SUSPECTED') return 'Email diduga terkait perusahaan atau identitas lain.';
+    return 'Terjadi error validasi; jangan digunakan sebelum diperiksa.';
+  }
+  if (isFreeEmailDomain_(result.emailDomain)) return 'Email gratis belum ditemukan pada kanal resmi perusahaan.';
+  if (result.presenceStatus === 'NOT_FOUND') return 'Identitas perusahaan belum cukup ditemukan di web.';
+  return 'Hubungan email dengan perusahaan belum cukup kuat; cek sumber bukti.';
+}
+
+function incrementFriendlySummary_(summary, status) {
+  if (status === 'TERVERIFIKASI') summary.verified++;
+  else if (status === 'KEMUNGKINAN VALID') summary.probable++;
+  else if (status === 'JANGAN DIGUNAKAN') summary.blocked++;
+  else summary.manual++;
+}
+
+function loadCompanyMasterIndex_(sheet) {
+  const index = { byKey: {}, byRow: {} };
+  if (sheet.getLastRow() < 2) return index;
+  const map = getHeaderMap_(sheet);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  rows.forEach(function (row, offset) {
+    const key = cleanText_(row[map['Company Key'] - 1]);
+    if (!key) return;
+    const item = {
+      outputRow: offset + 2,
+      key: key,
+      companyName: readMapped_(row, map, 'Company Name') || '',
+      location: readMapped_(row, map, 'Location') || '',
+      website: readMapped_(row, map, 'Official Website') || '',
+      domain: readMapped_(row, map, 'Official Domain') || '',
+      linkedin: readMapped_(row, map, 'LinkedIn') || '',
+      instagram: readMapped_(row, map, 'Instagram') || '',
+      ahuStatus: readMapped_(row, map, 'AHU Status') || '',
+      ahuRegisteredName: readMapped_(row, map, 'AHU Registered Name') || '',
+      ahuEvidence: readMapped_(row, map, 'AHU Evidence') || '',
+      status: readMapped_(row, map, 'Company Status') || '',
+      dataSource: readMapped_(row, map, 'Data Source') || '',
+      lastChecked: readMapped_(row, map, 'Last Checked') || '',
+      manualLock: readMapped_(row, map, 'Manual Lock') || 'NO',
+      notes: readMapped_(row, map, 'Notes') || ''
+    };
+    index.byKey[key] = item;
+    index.byRow[String(offset + 2)] = item;
+  });
+  return index;
+}
+
+function upsertCompanyMaster_(sheet, index, key, companyName, location, presence, dataSource, notes) {
+  if (!key) return;
+  const map = getHeaderMap_(sheet);
+  const existing = index.byKey[key];
+  if (existing && cleanText_(existing.manualLock).toUpperCase() === 'YES') return;
+
+  // Keputusan mempertahankan hasil lama dilakukan di getOrFindCompanyPresence_.
+  // Jangan blok overwrite di sini karena manual refresh harus bisa memperbaiki false-positive lama.
+  const outputRow = existing ? existing.outputRow : sheet.getLastRow() + 1;
+  const strongWebsite = presence.website && presence.website.status === 'MATCH';
+  const strongLinkedIn = presence.linkedin && /MATCH|OFFICIAL_LINK/.test(presence.linkedin.status || '');
+  const strongInstagram = presence.instagram && /MATCH|OFFICIAL_LINK/.test(presence.instagram.status || '');
+  const ahu = presence.ahu || { status: 'NOT_FOUND', registeredName: '', evidenceUrl: '' };
+
+  const values = {
+    'Company Key': key,
+    'Company Name': companyName,
+    'Location': location,
+    'Official Website': strongWebsite ? (presence.website.url || '') : '',
+    'Official Domain': strongWebsite ? (presence.website.domain || '') : '',
+    'LinkedIn': strongLinkedIn ? (presence.linkedin.url || '') : '',
+    'Instagram': strongInstagram ? (presence.instagram.url || '') : '',
+    'AHU Status': ahu.status || 'NOT_FOUND',
+    'AHU Registered Name': ahu.registeredName || '',
+    'AHU Evidence': ahu.evidenceUrl || '',
+    'Company Status': friendlyCompanyStatus_(presence.status),
+    'Data Source': dataSource || 'OPENAI WEB SEARCH',
+    'Last Checked': new Date(),
+    'Manual Lock': existing ? (existing.manualLock || 'NO') : 'NO',
+    'Notes': notes || ''
+  };
+
+  Object.keys(values).forEach(function (header) {
+    if (map[header]) sheet.getRange(outputRow, map[header]).setValue(values[header]);
+  });
+  applyCompanyStatusColor_(sheet, outputRow, map, values['Company Status']);
+
+  const item = {
+    outputRow: outputRow,
+    key: key,
+    companyName: companyName,
+    location: location,
+    website: values['Official Website'],
+    domain: values['Official Domain'],
+    linkedin: values['LinkedIn'],
+    instagram: values['Instagram'],
+    ahuStatus: values['AHU Status'],
+    ahuRegisteredName: values['AHU Registered Name'],
+    ahuEvidence: values['AHU Evidence'],
+    status: values['Company Status'],
+    dataSource: values['Data Source'],
+    lastChecked: values['Last Checked'],
+    manualLock: values['Manual Lock'],
+    notes: values['Notes']
+  };
+  index.byKey[key] = item;
+  index.byRow[String(outputRow)] = item;
+}
+
+function friendlyCompanyStatus_(technical) {
+  const status = cleanText_(technical).toUpperCase();
+  if (status === 'VERIFIED_STRONG' || status === 'KUAT') return 'KUAT';
+  if (status === 'FOUND' || status === 'ADA') return 'ADA';
+  if (status === 'REVIEW_REQUIRED' || status === 'PERLU CEK') return 'PERLU CEK';
+  return 'TIDAK DITEMUKAN';
+}
+
+function applyCompanyStatusColor_(sheet, row, map, status) {
+  const col = map['Company Status'];
+  if (!col) return;
+  const cell = sheet.getRange(row, col);
+  const normalized = cleanText_(status).toUpperCase();
+  var background = '#ffffff';
+  if (normalized === 'KUAT') background = '#b7e1cd';
+  else if (normalized === 'ADA') background = '#d9ead3';
+  else if (normalized === 'PERLU CEK') background = '#fff2cc';
+  else background = '#eeeeee';
+  cell.setBackground(background).setFontWeight('bold').setHorizontalAlignment('center');
+}
+
+function isUsableCompanyCache_(item) {
+  if (!item) return false;
+  if (cleanText_(item.manualLock).toUpperCase() === 'YES') return true;
+
+  // Cache provider lama dan Company Master sebelum AHU engine dianggap stale satu kali.
+  if (/BRAVE/.test(cleanText_(item.dataSource).toUpperCase())) return false;
+  if (!cleanText_(item.ahuStatus)) return false;
+
+  if (!item.lastChecked || !item.status) return false;
+  const checked = new Date(item.lastChecked);
+  if (isNaN(checked.getTime())) return false;
+  return Date.now() - checked.getTime() <=
+    EMAIL_VALIDATOR_CONFIG.COMPANY_CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+}
+
+function companyItemToPresence_(item) {
+  const status = technicalCompanyStatus_(item.status);
+  const websiteStatus = item.website && item.domain ? 'MATCH' : 'NOT_FOUND';
+  const ahuStatus = cleanText_(item.ahuStatus).toUpperCase() || 'NOT_FOUND';
+  return {
+    website: {
+      url: item.website || '', website: item.website || '', domain: item.domain || '',
+      status: websiteStatus, score: websiteStatus === 'MATCH' ? 60 : 0, source: item.website || ''
+    },
+    linkedin: {
+      url: item.linkedin || '', status: item.linkedin ? 'MATCH' : 'NOT_FOUND',
+      score: item.linkedin ? 50 : 0, source: item.linkedin || ''
+    },
+    instagram: {
+      url: item.instagram || '', status: item.instagram ? 'MATCH' : 'NOT_FOUND',
+      score: item.instagram ? 50 : 0, source: item.instagram || ''
+    },
+    ahu: {
+      status: ahuStatus,
+      registeredName: item.ahuRegisteredName || '',
+      evidenceUrl: item.ahuEvidence || '',
+      score: ahuStatus === 'MATCH' ? 25 : (ahuStatus === 'REVIEW' ? 6 : 0)
+    },
+    score: status === 'VERIFIED_STRONG' ? 80 : (status === 'FOUND' ? 50 : (status === 'REVIEW_REQUIRED' ? 20 : 0)),
+    status: status
+  };
+}
+
+function technicalCompanyStatus_(friendly) {
+  const value = cleanText_(friendly).toUpperCase();
+  if (value === 'KUAT' || value === 'VERIFIED_STRONG') return 'VERIFIED_STRONG';
+  if (value === 'ADA' || value === 'FOUND') return 'FOUND';
+  if (value === 'PERLU CEK' || value === 'REVIEW_REQUIRED') return 'REVIEW_REQUIRED';
+  return 'NOT_FOUND';
+}
+
+function companyPresenceRank_(status) {
+  const normalized = technicalCompanyStatus_(status);
+  if (normalized === 'VERIFIED_STRONG') return 3;
+  if (normalized === 'FOUND') return 2;
+  if (normalized === 'REVIEW_REQUIRED') return 1;
+  return 0;
+}
+
+function loadRawIndex_(sheet) {
+  const index = { rowsBySourceRow: {}, bySourceRow: {}, byValidationKey: {} };
+  if (sheet.getLastRow() < 2) return index;
+  const map = getHeaderMap_(sheet);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  rows.forEach(function (row, offset) {
+    const item = rawRowToResult_(row, map);
+    item.outputRow = offset + 2;
+    item.sourceRow = cleanText_(readMapped_(row, map, 'Source Row'));
+    item.companyName = cleanText_(readMapped_(row, map, 'Company Name'));
+    if (item.sourceRow) {
+      index.rowsBySourceRow[item.sourceRow] = item;
+      index.bySourceRow[item.sourceRow] = item.outputRow;
+    }
+    const key = makeValidationKey_(item.companyName, item.email);
+    if (key && (!index.byValidationKey[key] || isUsableEmailCache_(item))) index.byValidationKey[key] = item;
+  });
+  return index;
+}
+
+function upsertRawRow_(sheet, index, sourceRow, sourceValues, sourceMap, result) {
+  const map = getHeaderMap_(sheet);
+  const rowKey = String(sourceRow);
+  const outputRow = index.bySourceRow[rowKey] || sheet.getLastRow() + 1;
+  const values = {
+    'Source Row': sourceRow,
+    'Verification Date': sourceMap['Verification Date'] ? sourceValues[sourceMap['Verification Date'] - 1] : '',
+    'No': sourceMap['No'] ? sourceValues[sourceMap['No'] - 1] : '',
+    'Team': sourceMap['Team'] ? sourceValues[sourceMap['Team'] - 1] : '',
+    'Position': sourceMap['Position'] ? sourceValues[sourceMap['Position'] - 1] : '',
+    'Company Name': sourceMap['Company Name'] ? sourceValues[sourceMap['Company Name'] - 1] : '',
+    'Contact Type': sourceMap['Contact Type'] ? sourceValues[sourceMap['Contact Type'] - 1] : '',
+    'Email': result.email || '',
+    'Email Domain': result.emailDomain || '',
+    'Email Format': result.formatValid === true ? 'VALID' : (result.formatValid === false ? 'INVALID' : ''),
+    'Domain MX': result.hasMx === true ? 'ACTIVE' : (result.hasMx === false ? 'NO_MX' : ''),
+    'Official Website': result.officialWebsite || '',
+    'Website Match': result.websiteMatch || '',
+    'LinkedIn Company': result.linkedinUrl || '',
+    'LinkedIn Match': result.linkedinMatch || '',
+    'Instagram': result.instagramUrl || '',
+    'Instagram Match': result.instagramMatch || '',
+    'AHU Status': result.ahuStatus || '',
+    'AHU Registered Name': result.ahuRegisteredName || '',
+    'AHU Evidence': result.ahuEvidence || '',
+    'Company Presence Score': Number(result.presenceScore || 0),
+    'Company Presence Status': result.presenceStatus || '',
+    'Official Domain': result.officialDomain || '',
+    'Domain Match': result.domainMatch === true ? 'MATCH' : (result.domainMatch === false ? 'NO_MATCH' : ''),
+    'Exact Email Found': result.exactEmailFound === true ? 'FOUND' : (result.exactEmailFound === false ? 'NOT_FOUND' : ''),
+    'Company Matched': booleanFlag_(result.companyMatched),
+    'Other Company Suspected': booleanFlag_(result.otherCompanySuspected),
+    'Evidence Type': result.evidenceType || '',
+    'Evidence Source': result.evidenceSource || '',
+    'Email on Website': evidenceFlag_(result.emailOnWebsite),
+    'Website Evidence': result.websiteEvidence || '',
+    'Email on LinkedIn': evidenceFlag_(result.emailOnLinkedin),
+    'LinkedIn Evidence': result.linkedinEvidence || '',
+    'Email on Instagram': evidenceFlag_(result.emailOnInstagram),
+    'Instagram Evidence': result.instagramEvidence || '',
+    'Other Email Evidence': result.otherEmailEvidence || '',
+    'Validation Score': Number(result.score || 0),
+    'Validation Status': result.status || '',
+    'Validation Notes': result.notes || '',
+    'Company Data Source': result.companyDataSource || '',
+    'Email Data Source': result.emailDataSource || '',
+    'Validator Version': result.validatorVersion || EMAIL_VALIDATOR_CONFIG.VERSION,
+    'Last Checked': result.lastChecked || new Date()
+  };
+  Object.keys(values).forEach(function (header) {
+    if (map[header]) sheet.getRange(outputRow, map[header]).setValue(values[header]);
+  });
+
+  const item = rawRowToResult_(EMAIL_VALIDATOR_CONFIG.RAW_HEADERS.map(function (header) { return values[header]; }),
+    EMAIL_VALIDATOR_CONFIG.RAW_HEADERS.reduce(function (acc, header, i) { acc[header] = i + 1; return acc; }, {}));
+  item.outputRow = outputRow;
+  item.sourceRow = rowKey;
+  item.companyName = cleanText_(values['Company Name']);
+  index.rowsBySourceRow[rowKey] = item;
+  index.bySourceRow[rowKey] = outputRow;
+  const key = makeValidationKey_(item.companyName, item.email);
+  if (key && item.status !== 'PROCESSING') index.byValidationKey[key] = item;
+}
+
+function rawRowToResult_(row, map) {
+  return {
+    email: normalizeEmail_(readMapped_(row, map, 'Email')),
+    emailDomain: cleanText_(readMapped_(row, map, 'Email Domain')),
+    formatValid: cleanText_(readMapped_(row, map, 'Email Format')).toUpperCase() === 'VALID',
+    hasMx: cleanText_(readMapped_(row, map, 'Domain MX')).toUpperCase() === 'ACTIVE',
+    officialWebsite: cleanText_(readMapped_(row, map, 'Official Website')),
+    websiteMatch: cleanText_(readMapped_(row, map, 'Website Match')),
+    linkedinUrl: cleanText_(readMapped_(row, map, 'LinkedIn Company')),
+    linkedinMatch: cleanText_(readMapped_(row, map, 'LinkedIn Match')),
+    instagramUrl: cleanText_(readMapped_(row, map, 'Instagram')),
+    instagramMatch: cleanText_(readMapped_(row, map, 'Instagram Match')),
+    ahuStatus: cleanText_(readMapped_(row, map, 'AHU Status')),
+    ahuRegisteredName: cleanText_(readMapped_(row, map, 'AHU Registered Name')),
+    ahuEvidence: cleanText_(readMapped_(row, map, 'AHU Evidence')),
+    presenceScore: Number(readMapped_(row, map, 'Company Presence Score') || 0),
+    presenceStatus: cleanText_(readMapped_(row, map, 'Company Presence Status')),
+    officialDomain: cleanText_(readMapped_(row, map, 'Official Domain')),
+    domainMatch: cleanText_(readMapped_(row, map, 'Domain Match')).toUpperCase() === 'MATCH',
+    exactEmailFound: cleanText_(readMapped_(row, map, 'Exact Email Found')).toUpperCase() === 'FOUND',
+    companyMatched: parseBooleanFlag_(readMapped_(row, map, 'Company Matched')),
+    otherCompanySuspected: parseBooleanFlag_(readMapped_(row, map, 'Other Company Suspected')),
+    evidenceType: cleanText_(readMapped_(row, map, 'Evidence Type')),
+    evidenceSource: cleanText_(readMapped_(row, map, 'Evidence Source')),
+    emailOnWebsite: parseEvidenceFlag_(readMapped_(row, map, 'Email on Website')),
+    websiteEvidence: cleanText_(readMapped_(row, map, 'Website Evidence')),
+    emailOnLinkedin: parseEvidenceFlag_(readMapped_(row, map, 'Email on LinkedIn')),
+    linkedinEvidence: cleanText_(readMapped_(row, map, 'LinkedIn Evidence')),
+    emailOnInstagram: parseEvidenceFlag_(readMapped_(row, map, 'Email on Instagram')),
+    instagramEvidence: cleanText_(readMapped_(row, map, 'Instagram Evidence')),
+    otherEmailEvidence: cleanText_(readMapped_(row, map, 'Other Email Evidence')),
+    score: Number(readMapped_(row, map, 'Validation Score') || 0),
+    status: cleanText_(readMapped_(row, map, 'Validation Status')),
+    notes: cleanText_(readMapped_(row, map, 'Validation Notes')),
+    companyDataSource: cleanText_(readMapped_(row, map, 'Company Data Source')),
+    emailDataSource: cleanText_(readMapped_(row, map, 'Email Data Source')),
+    validatorVersion: cleanText_(readMapped_(row, map, 'Validator Version')),
+    lastChecked: readMapped_(row, map, 'Last Checked') || ''
+  };
+}
+
+function legacyRowToResult_(row, map) {
+  const result = rawRowToResult_(row, map);
+  if (result.officialWebsite && isBlockedOfficialDomain_(getDomain_(result.officialWebsite))) {
+    result.officialWebsite = '';
+    result.officialDomain = '';
+    result.websiteMatch = 'NOT_FOUND';
+  }
+  result.lastChecked = result.lastChecked || new Date();
+  return result;
+}
+
+function resultToPresence_(result) {
+  const websiteValid = result.officialWebsite && !isBlockedOfficialDomain_(getDomain_(result.officialWebsite));
+  const linkedStrong = Boolean(result.linkedinUrl && /MATCH|OFFICIAL_LINK/.test(result.linkedinMatch || 'MATCH'));
+  const instagramStrong = Boolean(result.instagramUrl && /MATCH|OFFICIAL_LINK/.test(result.instagramMatch || 'MATCH'));
+  const ahuStatus = cleanText_(result.ahuStatus).toUpperCase() || 'NOT_FOUND';
+  const ahuStrong = ahuStatus === 'MATCH';
+  const strongCount = (websiteValid ? 1 : 0) + (linkedStrong ? 1 : 0) +
+    (instagramStrong ? 1 : 0) + (ahuStrong ? 1 : 0);
+  var status = 'NOT_FOUND';
+  if (strongCount >= 2) status = 'VERIFIED_STRONG';
+  else if (strongCount === 1) status = 'FOUND';
+  else if (result.presenceStatus === 'REVIEW_REQUIRED' || ahuStatus === 'REVIEW') status = 'REVIEW_REQUIRED';
+
+  return {
+    website: {
+      url: websiteValid ? result.officialWebsite : '',
+      website: websiteValid ? result.officialWebsite : '',
+      domain: websiteValid ? (result.officialDomain || getDomain_(result.officialWebsite)) : '',
+      status: websiteValid ? 'MATCH' : 'NOT_FOUND', score: websiteValid ? 60 : 0,
+      source: websiteValid ? result.officialWebsite : ''
+    },
+    linkedin: {
+      url: result.linkedinUrl || '',
+      status: linkedStrong ? 'MATCH' : (result.linkedinUrl ? 'REVIEW' : 'NOT_FOUND'),
+      score: linkedStrong ? 50 : 0, source: result.linkedinUrl || ''
+    },
+    instagram: {
+      url: result.instagramUrl || '',
+      status: instagramStrong ? 'MATCH' : (result.instagramUrl ? 'REVIEW' : 'NOT_FOUND'),
+      score: instagramStrong ? 50 : 0, source: result.instagramUrl || ''
+    },
+    ahu: {
+      status: ahuStatus,
+      registeredName: result.ahuRegisteredName || '',
+      evidenceUrl: result.ahuEvidence || '',
+      score: ahuStrong ? 25 : (ahuStatus === 'REVIEW' ? 6 : 0)
+    },
+    score: strongCount >= 2 ? 80 : (strongCount === 1 ? 50 : (ahuStatus === 'REVIEW' ? 20 : 0)),
+    status: status
+  };
+}
+
+function copyRawResult_(cached) {
+  return {
+    email: cached.email || '', emailDomain: cached.emailDomain || '',
+    formatValid: cached.formatValid, hasMx: cached.hasMx,
+    officialWebsite: cached.officialWebsite || '', websiteMatch: cached.websiteMatch || '',
+    linkedinUrl: cached.linkedinUrl || '', linkedinMatch: cached.linkedinMatch || '',
+    instagramUrl: cached.instagramUrl || '', instagramMatch: cached.instagramMatch || '',
+    ahuStatus: cached.ahuStatus || '', ahuRegisteredName: cached.ahuRegisteredName || '',
+    ahuEvidence: cached.ahuEvidence || '',
+    presenceScore: Number(cached.presenceScore || 0), presenceStatus: cached.presenceStatus || '',
+    officialDomain: cached.officialDomain || '', domainMatch: cached.domainMatch,
+    exactEmailFound: cached.exactEmailFound, companyMatched: cached.companyMatched,
+    otherCompanySuspected: cached.otherCompanySuspected, evidenceType: cached.evidenceType || '',
+    evidenceSource: cached.evidenceSource || '',
+    emailOnWebsite: cached.emailOnWebsite, websiteEvidence: cached.websiteEvidence || '',
+    emailOnLinkedin: cached.emailOnLinkedin, linkedinEvidence: cached.linkedinEvidence || '',
+    emailOnInstagram: cached.emailOnInstagram, instagramEvidence: cached.instagramEvidence || '',
+    otherEmailEvidence: cached.otherEmailEvidence || '', score: Number(cached.score || 0),
+    status: cached.status || '', notes: cached.notes || '',
+    companyDataSource: cached.companyDataSource || '', emailDataSource: cached.emailDataSource || '',
+    validatorVersion: EMAIL_VALIDATOR_CONFIG.VERSION, lastChecked: new Date()
+  };
+}
+
+function isCompatibleValidatorVersion_(version) {
+  const normalized = cleanText_(version);
+  return EMAIL_VALIDATOR_CONFIG.CACHE_COMPATIBLE_VERSIONS.indexOf(normalized) !== -1;
+}
+
+function isUsableEmailCache_(cached) {
+  if (!cached || !isCompatibleValidatorVersion_(cached.validatorVersion)) return false;
+  if (!cached.status || cached.status === 'ERROR' || cached.status === 'PROCESSING') return false;
+  if (!cached.lastChecked) return false;
+  const checked = new Date(cached.lastChecked);
+  if (isNaN(checked.getTime())) return false;
+  return Date.now() - checked.getTime() <=
+    EMAIL_VALIDATOR_CONFIG.EMAIL_CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+}
+
+function emptyValidationResult_(email) {
+  return {
+    email: email || '', emailDomain: '', formatValid: null, hasMx: null,
+    officialWebsite: '', websiteMatch: '', linkedinUrl: '', linkedinMatch: '',
+    instagramUrl: '', instagramMatch: '',
+    ahuStatus: '', ahuRegisteredName: '', ahuEvidence: '',
+    presenceScore: 0, presenceStatus: '',
+    officialDomain: '', domainMatch: null, exactEmailFound: null,
+    companyMatched: null, otherCompanySuspected: null,
+    evidenceType: '', evidenceSource: '',
+    emailOnWebsite: null, websiteEvidence: '',
+    emailOnLinkedin: null, linkedinEvidence: '',
+    emailOnInstagram: null, instagramEvidence: '',
+    otherEmailEvidence: '', score: 0, status: '', notes: '',
+    companyDataSource: '', emailDataSource: '',
+    validatorVersion: EMAIL_VALIDATOR_CONFIG.VERSION, lastChecked: new Date()
+  };
+}
+
+function readMapped_(row, map, header) {
+  const col = map[header];
+  return col ? row[col - 1] : '';
+}
+
+function makeValidationKey_(companyName, email) {
+  const companyKey = makeCompanyKey_(companyName);
+  const normalizedEmail = normalizeEmail_(email);
+  return companyKey && normalizedEmail ? companyKey + '|' + normalizedEmail : '';
+}
+
+function makeCompanyKey_(companyName) {
+  return normalizeCompanyKey_(companyName);
+}
+
+function finishValidationBatch_(ss, state) {
+  const runId = cleanText_(state && state.runId);
+  if (runId && !isBatchRunActive_(runId)) {
+    deleteBatchStateIfRunMatches_(runId);
+    return;
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY);
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY);
+  if (!runId || isBatchRunActive_(runId)) {
+    props.deleteProperty(EMAIL_VALIDATOR_CONFIG.ACTIVE_RUN_ID_PROPERTY);
+  }
+  deleteValidatorContinuationTriggers_();
+  updateSummarySheet_(ss);
+  ss.toast(
+    'Selesai. Terverifikasi: ' + state.verified +
+    ', kemungkinan valid: ' + state.probable +
+    ', cek manual: ' + state.manual +
+    ', jangan digunakan: ' + state.blocked + '.',
+    'Email Validator', 10
+  );
+}
+
+function scheduleValidatorContinuation_(runId) {
+  if (!isBatchRunActive_(runId)) return;
+  deleteValidatorContinuationTriggers_();
+  if (!isBatchRunActive_(runId)) return;
+
+  ScriptApp.newTrigger(EMAIL_VALIDATOR_CONFIG.CONTINUE_HANDLER)
+    .timeBased().after(EMAIL_VALIDATOR_CONFIG.CONTINUE_AFTER_MS).create();
+
+  // Menutup race: kalau Stop terjadi persis saat trigger dibuat, hapus lagi.
+  if (!isBatchRunActive_(runId)) deleteValidatorContinuationTriggers_();
+}
+
+function deleteValidatorContinuationTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(function (trigger) {
+    if (trigger.getHandlerFunction() === EMAIL_VALIDATOR_CONFIG.CONTINUE_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+function isBatchRunActive_(runId) {
+  const id = cleanText_(runId);
+  if (!id) return true; // pemrosesan manual/selected rows tidak memakai batch run.
+  const active = cleanText_(PropertiesService.getScriptProperties().getProperty(
+    EMAIL_VALIDATOR_CONFIG.ACTIVE_RUN_ID_PROPERTY
+  ));
+  return Boolean(active && active === id);
+}
+
+function assertBatchRunActive_(runId) {
+  if (!runId) return;
+  if (!isBatchRunActive_(runId)) {
+    const error = new Error('__EMAIL_VALIDATOR_STOPPED__');
+    error.name = 'EmailValidatorStopped';
+    throw error;
+  }
+}
+
+function isBatchStoppedError_(error) {
+  if (!error) return false;
+  return error.name === 'EmailValidatorStopped' ||
+    getErrorMessage_(error).indexOf('__EMAIL_VALIDATOR_STOPPED__') !== -1;
+}
+
+function persistBatchStateIfActive_(state) {
+  const runId = cleanText_(state && state.runId);
+  if (!isBatchRunActive_(runId)) {
+    deleteBatchStateIfRunMatches_(runId);
+    return false;
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY, JSON.stringify(state));
+
+  // Stop bisa terjadi di antara check dan setProperty di atas.
+  if (!isBatchRunActive_(runId)) {
+    deleteBatchStateIfRunMatches_(runId);
+    return false;
+  }
+  return true;
+}
+
+function deleteBatchStateIfRunMatches_(runId) {
+  const id = cleanText_(runId);
+  const props = PropertiesService.getScriptProperties();
+  const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+  if (!stateText) return;
+
+  try {
+    const state = JSON.parse(stateText);
+    if (!id || cleanText_(state.runId) === id) {
+      props.deleteProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+      props.deleteProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY);
+    }
+  } catch (ignore) {
+    if (!id) {
+      props.deleteProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+      props.deleteProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY);
+    }
+  }
+}
+
+function clearBatchRunIfMatches_(runId) {
+  const id = cleanText_(runId);
+  const props = PropertiesService.getScriptProperties();
+  if (id && !isBatchRunActive_(id)) return;
+  deleteBatchStateIfRunMatches_(id);
+  if (!id || isBatchRunActive_(id)) props.deleteProperty(EMAIL_VALIDATOR_CONFIG.ACTIVE_RUN_ID_PROPERTY);
+}
+
+function getLastValidationDataRow_(sheet, headerMap) {
+  const physicalLastRow = sheet.getLastRow();
+  if (physicalLastRow < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW) return 0;
+
+  const companyCol = requireHeader_(headerMap, 'Company Name');
+  const typeCol = requireHeader_(headerMap, 'Contact Type');
+  const contactCol = requireHeader_(headerMap, 'Contact');
+  const firstCol = Math.min(companyCol, typeCol, contactCol);
+  const lastCol = Math.max(companyCol, typeCol, contactCol);
+  const width = lastCol - firstCol + 1;
+  const rowCount = physicalLastRow - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW + 1;
+  const values = sheet.getRange(
+    EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW, firstCol, rowCount, width
+  ).getDisplayValues();
+
+  const offsets = [companyCol, typeCol, contactCol].map(function (col) {
+    return col - firstCol;
+  });
+
+  for (var i = values.length - 1; i >= 0; i--) {
+    const hasValidationData = offsets.some(function (offset) {
+      return cleanText_(values[i][offset]) !== '';
+    });
+    if (hasValidationData) return EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW + i;
+  }
+  return 0;
+}
+
+function lookupMx_(domain, runId) {
+  if (!domain) return { hasMx: false, records: [] };
+
+  const url = 'https://dns.google/resolve?name=' + encodeURIComponent(domain) + '&type=MX';
+  assertBatchRunActive_(runId);
+  const response = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: { 'Accept': 'application/dns-json' },
+    muteHttpExceptions: true,
+    followRedirects: true
+  });
+
+  assertBatchRunActive_(runId);
+  const code = response.getResponseCode();
+  if (code < 200 || code >= 300) return { hasMx: false, records: [] };
+
+  const data = JSON.parse(response.getContentText() || '{}');
+  const answers = Array.isArray(data.Answer) ? data.Answer : [];
+  const records = answers
+    .filter(function (item) { return Number(item.type) === 15 && item.data; })
+    .map(function (item) { return String(item.data); });
+
+  return { hasMx: records.length > 0, records: records };
+}
+
+function openAIWebSearch_(query, runId) {
+  assertBatchRunActive_(runId);
+  const apiKey = assertValidatorApiKey_();
+  const url = 'https://api.openai.com/v1/responses';
+  const maxResults = EMAIL_VALIDATOR_CONFIG.MAX_SEARCH_RESULTS;
+
+  const body = {
+    model: EMAIL_VALIDATOR_CONFIG.OPENAI_MODEL,
+    store: false,
+    instructions: [
+      'You are a web-search adapter for an email/company verification system.',
+      'You MUST use web search for the supplied query.',
+      'Return only source-backed web results. Never invent a URL, email address, company identity, or social profile.',
+      'Preserve exact-email and site: search intent when it appears in the query.',
+      'Prefer results relevant to Indonesia when location is ambiguous.',
+      'Descriptions must summarize evidence visible from the searched source, not assumptions.',
+      'Return no more than ' + maxResults + ' results.'
+    ].join(' '),
+    input: 'Search the web for this query and return the most relevant source-backed results: ' + query,
+    tools: [{
+      type: 'web_search',
+      search_context_size: EMAIL_VALIDATOR_CONFIG.OPENAI_SEARCH_CONTEXT_SIZE,
+      user_location: {
+        type: 'approximate',
+        country: 'ID',
+        timezone: 'Asia/Jakarta'
+      }
+    }],
+    tool_choice: 'required',
+    max_tool_calls: 1,
+    include: ['web_search_call.action.sources'],
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'validator_web_search_results',
+        strict: true,
+        schema: {
+          type: 'object',
+          properties: {
+            results: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  title: { type: 'string' },
+                  url: { type: 'string' },
+                  description: { type: 'string' },
+                  extra_snippets: { type: 'array', items: { type: 'string' } }
+                },
+                required: ['title', 'url', 'description', 'extra_snippets'],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ['results'],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'Accept': 'application/json'
+    },
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+    followRedirects: true
+  });
+
+  assertBatchRunActive_(runId);
+  const code = response.getResponseCode();
+  const responseText = response.getContentText() || '';
+  if (code < 200 || code >= 300) {
+    throw new Error('OpenAI Web Search gagal (' + code + '): ' + truncate_(responseText, 500));
+  }
+
+  const payload = JSON.parse(responseText || '{}');
+  if (payload.error) {
+    throw new Error('OpenAI Web Search gagal: ' + truncate_(payload.error.message || JSON.stringify(payload.error), 500));
+  }
+
+  const sourceItems = collectOpenAIWebSources_(payload);
+  const sourceSet = {};
+  sourceItems.forEach(function (item) {
+    const key = canonicalSourceUrl_(item.url);
+    if (key) sourceSet[key] = true;
+  });
+
+  var parsedResults = [];
+  const outputText = extractOpenAIResponseText_(payload);
+  if (outputText) {
+    try {
+      const parsed = JSON.parse(outputText);
+      parsedResults = parsed && Array.isArray(parsed.results) ? parsed.results : [];
+    } catch (error) { console.warn(getErrorMessage_(error)); }
+  }
+
+  const hasSourceList = Object.keys(sourceSet).length > 0;
+  const seen = {};
+  const normalized = [];
+  parsedResults.forEach(function (item) {
+    if (normalized.length >= maxResults) return;
+    const resultUrl = cleanText_(item && item.url);
+    const key = canonicalSourceUrl_(resultUrl);
+    if (!resultUrl || !key || seen[key]) return;
+    if (hasSourceList && !sourceSet[key]) return; // cegah URL hasil fabrikasi model.
+
+    seen[key] = true;
+    normalized.push({
+      title: cleanText_(item.title),
+      url: resultUrl,
+      description: cleanText_(item.description),
+      extra_snippets: Array.isArray(item.extra_snippets)
+        ? item.extra_snippets.map(cleanText_).filter(Boolean).slice(0, 3)
+        : []
+    });
+  });
+
+  // Fallback: jika structured text kosong/tidak cocok, tetap gunakan URL source/citation
+  // yang benar-benar dikembalikan oleh Web Search.
+  if (!normalized.length) {
+    sourceItems.forEach(function (item) {
+      if (normalized.length >= maxResults) return;
+      const key = canonicalSourceUrl_(item.url);
+      if (!key || seen[key]) return;
+      seen[key] = true;
+      normalized.push({
+        title: cleanText_(item.title),
+        url: cleanText_(item.url),
+        description: '',
+        extra_snippets: []
+      });
+    });
+  }
+
+  return normalized.slice(0, maxResults);
+}
+
+function extractOpenAIResponseText_(payload) {
+  const parts = [];
+  const output = payload && Array.isArray(payload.output) ? payload.output : [];
+  output.forEach(function (item) {
+    if (!item || item.type !== 'message' || !Array.isArray(item.content)) return;
+    item.content.forEach(function (content) {
+      if (content && content.type === 'output_text' && content.text) parts.push(String(content.text));
+    });
+  });
+  return parts.join('').trim();
+}
+
+function collectOpenAIWebSources_(payload) {
+  const results = [];
+  const seen = {};
+  const output = payload && Array.isArray(payload.output) ? payload.output : [];
+
+  function add(url, title) {
+    const cleanUrl = cleanText_(url);
+    const key = canonicalSourceUrl_(cleanUrl);
+    if (!cleanUrl || !key || seen[key]) return;
+    seen[key] = true;
+    results.push({ url: cleanUrl, title: cleanText_(title) });
+  }
+
+  output.forEach(function (item) {
+    if (!item) return;
+
+    if (item.type === 'web_search_call' && item.action && Array.isArray(item.action.sources)) {
+      item.action.sources.forEach(function (source) {
+        if (source && source.url) add(source.url, source.title || '');
+      });
+    }
+
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      item.content.forEach(function (content) {
+        const annotations = content && Array.isArray(content.annotations) ? content.annotations : [];
+        annotations.forEach(function (annotation) {
+          if (annotation && annotation.type === 'url_citation' && annotation.url) {
+            add(annotation.url, annotation.title || '');
+          }
+        });
+      });
+    }
+  });
+
+  return results;
+}
+
+function canonicalSourceUrl_(url) {
+  return cleanText_(url)
+    .replace(/^https?:\/\/(www\.)?/i, '')
+    .split('#')[0]
+    .split('?')[0]
+    .replace(/\/+$/, '')
+    .toLowerCase();
+}
+
+function findCompanyPresence_(companyName, location, runId) {
+  const companyPhrase = '"' + sanitizeSearchPhrase_(companyName) + '"';
+  const locationText = cleanText_(location);
+
+  const websiteResults = openAIWebSearch_([
+    companyPhrase,
+    locationText,
+    'official website'
+  ].filter(Boolean).join(' '), runId);
+
+  const website = inferOfficialWebsite_(websiteResults, companyName, locationText);
+  const linkedProfiles = website.status === 'MATCH' && website.url
+    ? extractSocialLinksFromWebsite_(website.url, runId)
+    : { linkedin: '', instagram: '' };
+
+  var linkedin;
+  if (linkedProfiles.linkedin) {
+    linkedin = { url: linkedProfiles.linkedin, status: 'OFFICIAL_LINK', score: 100, source: website.url };
+  } else {
+    const linkedinResults = openAIWebSearch_([
+      'site:linkedin.com/company', companyPhrase, locationText
+    ].filter(Boolean).join(' '), runId);
+    linkedin = inferSocialProfile_(linkedinResults, companyName, locationText, 'LINKEDIN');
+  }
+
+  var instagram;
+  if (linkedProfiles.instagram) {
+    instagram = { url: linkedProfiles.instagram, status: 'OFFICIAL_LINK', score: 100, source: website.url };
+  } else {
+    const instagramResults = openAIWebSearch_([
+      'site:instagram.com', companyPhrase, locationText
+    ].filter(Boolean).join(' '), runId);
+    instagram = inferSocialProfile_(instagramResults, companyName, locationText, 'INSTAGRAM');
+  }
+
+  // AHU bersifat company-level dan disimpan ke Company Master, jadi query ini tidak diulang
+  // untuk perusahaan yang cache-nya masih valid.
+  const ahuResults = openAIWebSearch_([
+    'site:ahu.go.id', companyPhrase, locationText,
+    'perseroan OR sertifikat OR terdaftar'
+  ].filter(Boolean).join(' '), runId);
+  const ahu = inferAhuPresence_(ahuResults, companyName, locationText);
+
+  var score = 0;
+  if (website.status === 'MATCH') score += 45;
+  else if (website.status === 'REVIEW') score += 15;
+
+  if (linkedin.status === 'OFFICIAL_LINK') score += 30;
+  else if (linkedin.status === 'MATCH') score += 25;
+  else if (linkedin.status === 'REVIEW') score += 8;
+
+  if (instagram.status === 'OFFICIAL_LINK') score += 30;
+  else if (instagram.status === 'MATCH') score += 25;
+  else if (instagram.status === 'REVIEW') score += 8;
+
+  if (ahu.status === 'MATCH') score += 25;
+  else if (ahu.status === 'REVIEW') score += 6;
+
+  score = Math.min(100, score);
+
+  const strongCount = [website, linkedin, instagram].filter(function (item) {
+    return item.status === 'MATCH' || item.status === 'OFFICIAL_LINK';
+  }).length + (ahu.status === 'MATCH' ? 1 : 0);
+
+  var presenceStatus = 'NOT_FOUND';
+  if (strongCount >= 2 || (website.status === 'MATCH' && score >= 65)) {
+    presenceStatus = 'VERIFIED_STRONG';
+  } else if (strongCount === 1) {
+    presenceStatus = 'FOUND';
+  } else if (score > 0) {
+    presenceStatus = 'REVIEW_REQUIRED';
+  }
+
+  return {
+    website: website,
+    linkedin: linkedin,
+    instagram: instagram,
+    ahu: ahu,
+    score: score,
+    status: presenceStatus
+  };
+}
+
+
+function inferAhuPresence_(results, companyName, location) {
+  const companyTokens = tokenizeCompanyName_(companyName);
+  const companyKey = normalizeCompanyKey_(companyName);
+  const locationTokens = tokenizeLocation_(location);
+  const candidates = [];
+  const seen = {};
+
+  results.forEach(function (item, index) {
+    const url = cleanText_(item && item.url);
+    const domain = getDomain_(url);
+    if (!url || !isOfficialAhuDomain_(domain)) return;
+
+    const canonical = canonicalSourceUrl_(url);
+    if (!canonical || seen[canonical]) return;
+    seen[canonical] = true;
+
+    const rawTitle = cleanText_(item.title || '');
+    const rawDescription = cleanText_(item.description || '');
+    const snippets = Array.isArray(item.extra_snippets) ? item.extra_snippets.join(' ') : '';
+    const evidenceText = cleanText_([rawTitle, rawDescription, snippets].join(' '));
+    const normalizedEvidence = normalizeText_(evidenceText);
+
+    const tokenMatches = countTokenMatches_(companyTokens, normalizedEvidence);
+    const needed = requiredCompanyTokenMatches_(companyTokens);
+    if (tokenMatches < needed) return;
+
+    const exactName = Boolean(companyKey && normalizedEvidence.indexOf(companyKey) !== -1);
+    const locationMatches = countTokenMatches_(locationTokens, normalizedEvidence);
+    const entitySpecificSignal = /\b(sertifikat|terdaftar|berkedudukan|perseroan|profil|nomor\s+ahu|daftar\s+perseroan)\b/i
+      .test(evidenceText);
+
+    var score = tokenMatches * 16 + Math.max(0, 8 - index);
+    if (exactName) score += 30;
+    if (entitySpecificSignal) score += 18;
+    if (locationMatches) score += Math.min(10, locationMatches * 4);
+
+    const registeredName = extractAhuRegisteredName_(evidenceText, companyName);
+    const status = exactName && entitySpecificSignal && score >= 60
+      ? 'MATCH'
+      : (score >= 45 ? 'REVIEW' : 'NOT_FOUND');
+
+    if (status === 'NOT_FOUND') return;
+    candidates.push({
+      status: status,
+      registeredName: registeredName,
+      evidenceUrl: url,
+      score: Math.min(100, score),
+      source: url
+    });
+  });
+
+  candidates.sort(function (a, b) {
+    if (a.status !== b.status) return a.status === 'MATCH' ? -1 : 1;
+    return b.score - a.score;
+  });
+
+  return candidates.length ? candidates[0] : {
+    status: 'NOT_FOUND',
+    registeredName: '',
+    evidenceUrl: '',
+    score: 0,
+    source: ''
+  };
+}
+
+function isOfficialAhuDomain_(domain) {
+  const value = String(domain || '').toLowerCase().replace(/^www\./, '');
+  return value === 'ahu.go.id' || endsWithText_(value, '.ahu.go.id');
+}
+
+function extractAhuRegisteredName_(evidenceText, companyName) {
+  const text = cleanText_(evidenceText).replace(/\s+/g, ' ');
+  if (!text) return '';
+
+  const legalNameMatch = text.match(
+    /\b((?:PT|CV|YAYASAN|PERKUMPULAN|KOPERASI)\s+[A-Z0-9][A-Z0-9 .,&()\/'-]{2,100}?)(?=\s+(?:BERKEDUDUKAN|TELAH|TERDAFTAR|NOMOR|ADALAH|YANG)\b|[|;]|$)/i
+  );
+  if (legalNameMatch) return cleanText_(legalNameMatch[1]).replace(/[.,;:-]+$/, '');
+
+  const companyKey = normalizeCompanyKey_(companyName);
+  return companyKey && normalizeText_(text).indexOf(companyKey) !== -1
+    ? cleanText_(companyName)
+    : '';
+}
+
+function inferOfficialWebsite_(results, companyName, location) {
+  const companyTokens = tokenizeCompanyName_(companyName);
+  const companyKey = normalizeCompanyKey_(companyName);
+  const locationTokens = tokenizeLocation_(location);
+  const candidates = [];
+  const seen = {};
+
+  results.forEach(function (item, index) {
+    const url = cleanText_(item.url);
+    const domain = getDomain_(url);
+    if (!url || !domain || isBlockedOfficialDomain_(domain) || seen[domain]) return;
+
+    const title = normalizeText_(item.title || '');
+    const description = normalizeText_(item.description || '');
+    const haystack = normalizeText_([title, description, url].join(' '));
+
+    const tokenMatches = countTokenMatches_(companyTokens, haystack);
+    const needed = requiredCompanyTokenMatches_(companyTokens);
+    if (tokenMatches < needed) return;
+
+    const domainMatches = companyTokens.filter(function (token) {
+      return domain.indexOf(token) !== -1;
+    }).length;
+    const locationMatches = countTokenMatches_(locationTokens, haystack);
+    const exactNameInTitle = companyKey && title.indexOf(companyKey) !== -1;
+    const officialClaim = /\bofficial\b|\bresmi\b/.test(haystack);
+
+    // Website resmi harus memiliki sinyal kuat. Ini mencegah direktori wisata/lowongan
+    // yang hanya menyebut nama perusahaan dipilih sebagai website resmi.
+    if (!domainMatches && !exactNameInTitle && !officialClaim) return;
+
+    var score = tokenMatches * 14 + Math.max(0, 10 - index);
+    score += domainMatches * 18;
+    if (exactNameInTitle) score += 20;
+    if (officialClaim) score += 8;
+    if (locationMatches) score += Math.min(8, locationMatches * 3);
+    if (/\.co\.id$|\.id$/.test(domain)) score += 2;
+
+    const hasStrongOwnershipSignal = domainMatches > 0 || officialClaim;
+    const status = score >= 55 && hasStrongOwnershipSignal ? 'MATCH' : 'REVIEW';
+    seen[domain] = true;
+    candidates.push({
+      url: getOrigin_(url),
+      website: getOrigin_(url),
+      domain: domain,
+      status: status,
+      score: score,
+      source: url
+    });
+  });
+
+  candidates.sort(function (a, b) { return b.score - a.score; });
+  return candidates.length ? candidates[0] : {
+    url: '',
+    website: '',
+    domain: '',
+    status: 'NOT_FOUND',
+    score: 0,
+    source: ''
+  };
+}
+
+function inferSocialProfile_(results, companyName, location, platform) {
+  const companyTokens = tokenizeCompanyName_(companyName);
+  const companyKey = normalizeCompanyKey_(companyName);
+  const locationTokens = tokenizeLocation_(location);
+  const candidates = [];
+  const seen = {};
+
+  results.forEach(function (item, index) {
+    const rawUrl = cleanText_(item.url);
+    const normalizedUrl = normalizeSocialProfileUrl_(rawUrl, platform);
+    if (!normalizedUrl || seen[normalizedUrl]) return;
+
+    const title = normalizeText_(item.title || '');
+    const description = normalizeText_(item.description || '');
+    const slug = normalizeText_(getSocialSlug_(normalizedUrl, platform));
+
+    // IDENTITAS UTAMA:
+    // description TIDAK boleh membuat kandidat menjadi MATCH.
+    const identityText = normalizeText_([title, slug].join(' '));
+
+    const identityMatches = countTokenMatches_(companyTokens, identityText);
+    const slugMatches = countTokenMatches_(companyTokens, slug);
+    const needed = requiredCompanyTokenMatches_(companyTokens);
+
+    const exactNameInTitle =
+      Boolean(companyKey) &&
+      title.indexOf(companyKey) !== -1;
+
+    const exactNameInSlug =
+      Boolean(companyKey) &&
+      slug.indexOf(companyKey) !== -1;
+
+    // Kandidat wajib cocok dari TITLE / SLUG.
+    // Description hanya boleh jadi supporting evidence.
+    if (
+      !exactNameInTitle &&
+      !exactNameInSlug &&
+      identityMatches < needed
+    ) {
+      return;
+    }
+
+    const descriptionMatches =
+      countTokenMatches_(companyTokens, description);
+
+    const locationHaystack =
+      normalizeText_([title, description, slug].join(' '));
+
+    const locationMatches =
+      countTokenMatches_(locationTokens, locationHaystack);
+
+    var score = 0;
+
+    // Bukti identitas utama
+    score += identityMatches * 18;
+    score += slugMatches * 18;
+
+    if (exactNameInTitle) score += 30;
+    if (exactNameInSlug) score += 35;
+
+    // Description hanya BONUS, tidak menentukan kelolosan.
+    score += Math.min(10, descriptionMatches * 3);
+
+    if (locationMatches) {
+      score += Math.min(10, locationMatches * 4);
+    }
+
+    // Ranking search result hanya bonus sangat kecil
+    score += Math.max(0, 5 - index);
+
+    // Untuk nama perusahaan yang punya >= 2 token penting,
+    // minimal 2 token harus benar-benar muncul di title/slug
+    // kecuali nama penuh cocok.
+    if (
+      companyTokens.length >= 2 &&
+      !exactNameInTitle &&
+      !exactNameInSlug &&
+      identityMatches < 2
+    ) {
+      return;
+    }
+
+    candidates.push({
+      url: normalizedUrl,
+      status: score >= 55 ? 'MATCH' : 'REVIEW',
+      score: score,
+      source: rawUrl
+    });
+
+    seen[normalizedUrl] = true;
+  });
+
+  candidates.sort(function (a, b) {
+    return b.score - a.score;
+  });
+
+  return candidates.length
+    ? candidates[0]
+    : {
+        url: '',
+        status: 'NOT_FOUND',
+        score: 0,
+        source: ''
+      };
+}
+
+function extractSocialLinksFromWebsite_(websiteUrl, runId) {
+  const page = fetchPageHtml_(websiteUrl, runId);
+  if (!page.html) return { linkedin: '', instagram: '' };
+
+  const hrefs = [];
+  const regex = /href\s*=\s*["']([^"']+)["']/gi;
+  while (hrefs.length < 500) {
+    const hrefMatch = regex.exec(page.html);
+    if (hrefMatch === null) break;
+    hrefs.push(decodeHtmlEntities_(hrefMatch[1]));
+  }
+
+  var linkedin = '';
+  var instagram = '';
+  hrefs.forEach(function (href) {
+    if (!linkedin) linkedin = normalizeSocialProfileUrl_(href, 'LINKEDIN');
+    if (!instagram) instagram = normalizeSocialProfileUrl_(href, 'INSTAGRAM');
+  });
+
+  return { linkedin: linkedin, instagram: instagram };
+}
+
+function fetchPageHtml_(url, runId) {
+  if (!isSafePublicUrl_(url)) return { html: '', finalUrl: url };
+
+  try {
+    assertBatchRunActive_(runId);
+    const response = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml',
+        'User-Agent': 'Mozilla/5.0 (compatible; CompanyEmailValidator/3.2)'
+      },
+      muteHttpExceptions: true,
+      followRedirects: true,
+      validateHttpsCertificates: true
+    });
+
+    assertBatchRunActive_(runId);
+    const code = response.getResponseCode();
+    if (code < 200 || code >= 400) return { html: '', finalUrl: url };
+    return { html: truncate_(response.getContentText() || '', 500000), finalUrl: url };
+  } catch (error) {
+    if (isBatchStoppedError_(error)) throw error;
+    return { html: '', finalUrl: url };
+  }
+}
+
+function normalizeSocialProfileUrl_(url, platform) {
+  const rawValue = cleanText_(url);
+  if (!rawValue) return '';
+
+  const valueWithScheme = rawValue.indexOf('//') === 0 ? 'https:' + rawValue : rawValue;
+  if (!/^https?:\/\//i.test(valueWithScheme)) return '';
+
+  const normalizedValue = valueWithScheme.split('#')[0].split('?')[0];
+  const domain = getDomain_(normalizedValue);
+  const lowerPlatform = String(platform || '').toUpperCase();
+
+  if (lowerPlatform === 'LINKEDIN') {
+    if (!(domain === 'linkedin.com' || endsWithText_(domain, '.linkedin.com'))) return '';
+    const linkedinMatch = normalizedValue.match(/linkedin\.com\/company\/([^\/?#]+)/i);
+    if (!linkedinMatch) return '';
+    const slug = cleanText_(linkedinMatch[1]).replace(/^@/, '').replace(/\/+$/, '');
+    return slug ? 'https://www.linkedin.com/company/' + slug : '';
+  }
+
+  if (lowerPlatform === 'INSTAGRAM') {
+    if (!(domain === 'instagram.com' || endsWithText_(domain, '.instagram.com'))) return '';
+    const instagramMatch = normalizedValue.match(/instagram\.com\/([^\/?#]+)/i);
+    if (!instagramMatch) return '';
+    const username = cleanText_(instagramMatch[1]).replace(/^@/, '').replace(/\/+$/, '');
+    if (!username || /^(p|reel|reels|stories|explore|accounts|direct|about|developer)$/i.test(username)) {
+      return '';
+    }
+    return 'https://www.instagram.com/' + username + '/';
+  }
+
+  return '';
+}
+
+function getSocialSlug_(url, platform) {
+  const value = cleanText_(url);
+  if (String(platform).toUpperCase() === 'LINKEDIN') {
+    const match = value.match(/linkedin\.com\/company\/([^\/?#]+)/i);
+    return match ? match[1] : '';
+  }
+  if (String(platform).toUpperCase() === 'INSTAGRAM') {
+    const match = value.match(/instagram\.com\/([^\/?#]+)/i);
+    return match ? match[1] : '';
+  }
+  return '';
+}
+
+function sameSocialProfile_(urlA, urlB, platform) {
+  const a = normalizeSocialProfileUrl_(urlA, platform);
+  const b = normalizeSocialProfileUrl_(urlB, platform);
+  return Boolean(a && b && a.toLowerCase() === b.toLowerCase());
+}
+
+function sanitizeSearchPhrase_(value) {
+  return cleanText_(value).replace(/["\\]/g, ' ');
+}
+
+function tokenizeLocation_(location) {
+  const stopWords = { kota: true, kabu: true, kabupaten: true, province: true, provinsi: true };
+  return unique_(normalizeText_(location).split(/\s+/).filter(function (token) {
+    return token.length >= 3 && !stopWords[token];
+  }));
+}
+
+function countTokenMatches_(tokens, haystack) {
+  return tokens.filter(function (token) {
+    return haystack.indexOf(token) !== -1;
+  }).length;
+}
+
+function requiredCompanyTokenMatches_(tokens) {
+  if (!tokens.length) return 0;
+  if (tokens.length === 1) return 1;
+  return Math.min(2, tokens.length);
+}
+
+function findEmailEvidence_(results, companyName, email, presence, runId) {
+  const companyTokens = tokenizeCompanyName_(companyName);
+  const channels = {
+    website: { found: false, sourceUrl: '', score: -999 },
+    linkedin: { found: false, sourceUrl: '', score: -999 },
+    instagram: { found: false, sourceUrl: '', score: -999 },
+    other: { found: false, sourceUrl: '', score: -999 }
+  };
+  var best = {
+    exactFound: false,
+    companyMatched: false,
+    otherCompanySuspected: false,
+    type: '',
+    sourceUrl: '',
+    score: -999,
+    channels: channels
+  };
+
+  const limitedResults = (results || []).slice(0, EMAIL_VALIDATOR_CONFIG.MAX_PAGES_TO_INSPECT);
+  for (var i = 0; i < limitedResults.length; i++) {
+    assertBatchRunActive_(runId);
+    const item = limitedResults[i];
+    const url = cleanText_(item.url);
+    if (!url) continue;
+
+    const domain = getDomain_(url);
+    const snippetText = [
+      item.title || '',
+      item.description || '',
+      Array.isArray(item.extra_snippets) ? item.extra_snippets.join(' ') : ''
+    ].join(' ');
+
+    const page = fetchPageText_(url, runId);
+    const combined = normalizeEvidenceText_(snippetText + ' ' + (page.text || ''));
+    const exactFound = containsEmail_(combined, email.toLowerCase());
+    const tokenMatches = countTokenMatches_(companyTokens, combined);
+    const companyMatched = tokenMatches >= requiredCompanyTokenMatches_(companyTokens);
+
+    var type = 'OTHER_PUBLIC_SOURCE';
+    var channel = 'other';
+    if (presence.website.domain && sameRegistrableDomain_(domain, presence.website.domain)) {
+      type = 'OFFICIAL_WEBSITE';
+      channel = 'website';
+    } else if (sameSocialProfile_(url, presence.linkedin.url, 'LINKEDIN') || /(^|\.)linkedin\.com$/.test(domain)) {
+      type = companyMatched ? 'OFFICIAL_LINKEDIN' : 'LINKEDIN_SOURCE';
+      channel = 'linkedin';
+    } else if (sameSocialProfile_(url, presence.instagram.url, 'INSTAGRAM') || /(^|\.)instagram\.com$/.test(domain)) {
+      type = companyMatched ? 'OFFICIAL_INSTAGRAM' : 'INSTAGRAM_SOURCE';
+      channel = 'instagram';
+    } else if (/facebook\.com|tiktok\.com/.test(domain) && companyMatched) {
+      type = 'OTHER_OFFICIAL_SOCIAL';
+    } else if (/jobstreet|glints|kalibrr|indeed|dealls|loker|kitalulus|karir|jobs\./.test(domain)) {
+      type = 'THIRD_PARTY_JOB_POST';
+    }
+
+    var score = 0;
+    if (exactFound) score += 50;
+    if (companyMatched) score += 30;
+    if (type === 'OFFICIAL_WEBSITE') score += 25;
+    if (type === 'OFFICIAL_LINKEDIN' || type === 'OFFICIAL_INSTAGRAM') score += 20;
+    if (type === 'OTHER_OFFICIAL_SOCIAL') score += 15;
+    if (type === 'THIRD_PARTY_JOB_POST') score += 8;
+
+    const otherCompanySuspected = exactFound && !companyMatched && companyTokens.length > 0;
+    if (otherCompanySuspected) score -= 20;
+
+    if (exactFound && score > channels[channel].score) {
+      channels[channel] = { found: true, sourceUrl: page.finalUrl || url, score: score };
+    }
+
+    if (score > best.score) {
+      best = {
+        exactFound: exactFound,
+        companyMatched: companyMatched,
+        otherCompanySuspected: otherCompanySuspected,
+        type: type,
+        sourceUrl: page.finalUrl || url,
+        score: score,
+        channels: channels
+      };
+    }
+
+    // Early stop: bukti exact + perusahaan cocok + kanal resmi sudah cukup kuat.
+    if (exactFound && companyMatched &&
+        (type === 'OFFICIAL_WEBSITE' || type === 'OFFICIAL_LINKEDIN' ||
+         type === 'OFFICIAL_INSTAGRAM' || type === 'OTHER_OFFICIAL_SOCIAL')) {
+      break;
+    }
+  }
+
+  best.exactFound = channels.website.found || channels.linkedin.found ||
+    channels.instagram.found || channels.other.found;
+  best.channels = channels;
+  return best;
+}
+
+function fetchPageText_(url, runId) {
+  if (!isSafePublicUrl_(url)) return { text: '', finalUrl: url };
+
+  try {
+    assertBatchRunActive_(runId);
+    const response = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,text/plain',
+        'User-Agent': 'Mozilla/5.0 (compatible; CompanyEmailValidator/3.2)'
+      },
+      muteHttpExceptions: true,
+      followRedirects: true,
+      validateHttpsCertificates: true
+    });
+
+    assertBatchRunActive_(runId);
+    const code = response.getResponseCode();
+    if (code < 200 || code >= 400) return { text: '', finalUrl: url };
+
+    const raw = response.getContentText() || '';
+    const text = decodeHtmlEntities_(raw)
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ');
+
+    return { text: truncate_(text, 250000), finalUrl: url };
+  } catch (error) {
+    if (isBatchStoppedError_(error)) throw error;
+    return { text: '', finalUrl: url };
+  }
+}
+
+function containsEmail_(text, email) {
+  if (!text || !email) return false;
+  const normalized = String(text).toLowerCase();
+  if (normalized.indexOf(email) !== -1) return true;
+
+  const parts = email.split('@');
+  if (parts.length !== 2) return false;
+  const local = escapeRegExp_(parts[0]);
+  const domainParts = parts[1].split('.').map(escapeRegExp_);
+  const domainPattern = domainParts.join('(?:\\s*(?:\\.|\\[dot\\]|\\(dot\\)|dot)\\s*)');
+  const pattern = new RegExp(
+    local + '(?:\\s*(?:@|\\[at\\]|\\(at\\)|at)\\s*)' + domainPattern,
+    'i'
+  );
+  return pattern.test(normalized);
+}
+
+
+function assertValidatorApiKey_() {
+  const key = cleanText_(PropertiesService.getScriptProperties().getProperty(
+    EMAIL_VALIDATOR_CONFIG.API_KEY_PROPERTY
+  ));
+  if (!key) {
+    throw new Error('OpenAI API key belum disimpan. Gunakan menu Email Validator → Simpan OpenAI API Key.');
+  }
+  return key;
+}
+
+function getHeaderMap_(sheet) {
+  const lastColumn = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet
+    .getRange(EMAIL_VALIDATOR_CONFIG.HEADER_ROW, 1, 1, lastColumn)
+    .getDisplayValues()[0];
+  const map = {};
+
+  headers.forEach(function (header, index) {
+    const cleaned = cleanText_(header);
+    if (cleaned) map[cleaned] = index + 1;
+  });
+  return map;
+}
+
+function requireHeader_(headerMap, header) {
+  if (!headerMap[header]) throw new Error('Header wajib "' + header + '" tidak ditemukan.');
+  return headerMap[header];
+}
+
+function buildLocationText_(rowValues, headerMap) {
+  const possibleHeaders = ['Province', 'City', 'District', 'Work Location'];
+  return unique_(possibleHeaders.map(function (header) {
+    const col = headerMap[header];
+    return col ? cleanText_(rowValues[col - 1]) : '';
+  }).filter(Boolean)).join(' ');
+}
+
+function normalizeEmail_(value) {
+  const text = cleanText_(value).toLowerCase();
+  const match = text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}/i);
+  return match ? match[0].replace(/[),.;:'"<>]+$/g, '') : text;
+}
+
+function isValidEmailFormat_(email) {
+  if (!email || email.length > 254) return false;
+  return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/i.test(email);
+}
+
+function isFreeEmailDomain_(domain) {
+  return FREE_EMAIL_DOMAINS_.indexOf(String(domain || '').toLowerCase()) !== -1;
+}
+
+function normalizeCompanyKey_(companyName) {
+  return normalizeText_(companyName)
+    .replace(/\b(pt|cv|tbk|ltd|inc|corp|corporation|company|group|indonesia)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenizeCompanyName_(companyName) {
+  const stopWords = {
+    pt: true, cv: true, tbk: true, ltd: true, inc: true, corp: true,
+    corporation: true, company: true, group: true, indonesia: true,
+    the: true, and: true, dan: true, resto: true, restaurant: true
+  };
+
+  return unique_(normalizeText_(companyName)
+    .split(/\s+/)
+    .filter(function (token) { return token.length >= 3 && !stopWords[token]; }));
+}
+
+function normalizeEvidenceText_(text) {
+  return decodeHtmlEntities_(String(text || ''))
+    .toLowerCase()
+    .replace(/\s*(?:\[at\]|\(at\))\s*/gi, '@')
+    .replace(/\s+at\s+/gi, '@')
+    .replace(/\s*(?:\[dot\]|\(dot\))\s*/gi, '.')
+    .replace(/\s+dot\s+/gi, '.')
+    .replace(/\s+/g, ' ');
+}
+
+function normalizeText_(value) {
+  return cleanText_(value)
+    .toLowerCase()
+    .replace(/[àáâãäå]/g, 'a')
+    .replace(/[èéêë]/g, 'e')
+    .replace(/[ìíîï]/g, 'i')
+    .replace(/[òóôõö]/g, 'o')
+    .replace(/[ùúûü]/g, 'u')
+    .replace(/[ç]/g, 'c')
+    .replace(/[ñ]/g, 'n')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanText_(value) {
+  return String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+}
+
+function getOrigin_(url) {
+  const match = String(url || '').match(/^(https?:\/\/[^\/]+)/i);
+  return match ? match[1] : '';
+}
+
+function getDomain_(urlOrDomain) {
+  var value = cleanText_(urlOrDomain).toLowerCase();
+  value = value.replace(/^https?:\/\//, '').split('/')[0].split(':')[0];
+  return value.replace(/^www\./, '').replace(/\.$/, '');
+}
+
+function endsWithText_(value, suffix) {
+  const text = String(value || '');
+  const ending = String(suffix || '');
+  if (!ending) return true;
+  if (ending.length > text.length) return false;
+  return text.slice(text.length - ending.length) === ending;
+}
+
+function sameRegistrableDomain_(domainA, domainB) {
+  const a = getDomain_(domainA);
+  const b = getDomain_(domainB);
+  if (!a || !b) return false;
+  return a === b || endsWithText_(a, '.' + b) || endsWithText_(b, '.' + a);
+}
+
+function isBlockedOfficialDomain_(domain) {
+  const value = getDomain_(domain);
+  return BLOCKED_OFFICIAL_DOMAINS_.some(function (blocked) {
+    return value === blocked || endsWithText_(value, '.' + blocked);
+  });
+}
+
+function isSafePublicUrl_(url) {
+  const value = cleanText_(url);
+  if (!/^https?:\/\//i.test(value)) return false;
+  const domain = getDomain_(value);
+  if (!domain || domain === 'localhost' || /^127\./.test(domain)) return false;
+  if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(domain)) return false;
+  return true;
+}
+
+function decodeHtmlEntities_(text) {
+  return String(text || '')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#64;/gi, '@')
+    .replace(/&#46;/gi, '.');
+}
+
+function unique_(items) {
+  const seen = {};
+  return items.filter(function (item) {
+    const key = String(item);
+    if (seen[key]) return false;
+    seen[key] = true;
+    return true;
+  });
+}
+
+function appendNote_(current, extra) {
+  const a = cleanText_(current);
+  const b = cleanText_(extra);
+  if (!a) return b;
+  if (!b || a.indexOf(b) !== -1) return a;
+  return a + ' ' + b;
+}
+
+function escapeRegExp_(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function truncate_(text, maxLength) {
+  const value = String(text || '');
+  return value.length <= maxLength ? value : value.slice(0, maxLength) + '…';
+}
+
+function getErrorMessage_(error) {
+  if (!error) return 'Unknown error';
+  return cleanText_(error.message || error.toString());
+}
