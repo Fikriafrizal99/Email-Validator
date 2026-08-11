@@ -2893,11 +2893,26 @@ function findCompanyPresence_(companyName, location, runId) {
   if (linkedProfiles.instagram) {
     instagram = { url: linkedProfiles.instagram, status: 'OFFICIAL_LINK', score: 100, source: website.url };
   } else {
-    const instagramResults = openAIWebSearch_([
-      'site:instagram.com',
-      buildCompanySearchQuery_(companyName, locationText, 'official profile')
+    var instagramResults = openAIWebSearch_([
+      'site:instagram.com/',
+      buildDirectCompanySearchQuery_(companyName, locationText, 'official Instagram profile')
     ].filter(Boolean).join(' '), runId);
     instagram = inferSocialProfile_(instagramResults, companyName, locationText, 'INSTAGRAM');
+
+    if (instagram.status !== 'MATCH') {
+      const instagramEvidenceResults = openAIWebSearch_([
+        buildCompanySearchQuery_(companyName, locationText, 'Instagram official account handle')
+      ].filter(Boolean).join(' '), runId);
+      const directFallback = inferSocialProfile_(
+        instagramEvidenceResults, companyName, locationText, 'INSTAGRAM'
+      );
+      const evidenceFallback = discoverInstagramFromTrustedEvidence_(
+        instagramEvidenceResults, companyName, locationText, website.domain, runId
+      );
+      [directFallback, evidenceFallback].forEach(function (candidate) {
+        if ((candidate.score || 0) > (instagram.score || 0)) instagram = candidate;
+      });
+    }
   }
 
   // Resolver legal dimulai dari nama operasional di AHU. Jika belum cukup,
@@ -3359,7 +3374,7 @@ function inferSocialProfile_(results, companyName, location, platform) {
       status: status,
       score: score,
       contextSupported: contextSupported,
-      source: rawUrl
+      source: cleanText_(item.evidenceSource) || rawUrl
     });
 
     seen[normalizedUrl] = true;
@@ -3399,6 +3414,55 @@ function extractSocialLinksFromWebsite_(websiteUrl, runId) {
   });
 
   return { linkedin: linkedin, instagram: instagram };
+}
+
+function discoverInstagramFromTrustedEvidence_(results, companyName, location, officialDomain, runId) {
+  const identity = buildCompanyIdentity_(companyName);
+  const candidates = [];
+
+  (results || []).slice(0, 5).forEach(function (item) {
+    const evidenceUrl = cleanText_(item && item.url);
+    if (!isTrustedSocialEvidenceUrl_(evidenceUrl, officialDomain)) return;
+
+    const evidenceText = normalizeText_([
+      item && item.title, item && item.description
+    ].join(' '));
+    const identityMatch = getCompanyIdentityMatch_(identity, evidenceText, '');
+    const fullIdentitySupported = identityMatch.fullNameSupported ||
+      containsNormalizedPhrase_(evidenceText, identity.canonicalKey) ||
+      countTokenMatches_(identity.fullNameTokens, evidenceText) >=
+        requiredCompanyTokenMatches_(identity.fullNameTokens);
+    if (!identityMatch.matched || !fullIdentitySupported) return;
+
+    const page = fetchPageHtml_(evidenceUrl, runId);
+    if (!page.html) return;
+    const regex = /href\s*=\s*["']([^"']+)["']/gi;
+    var match;
+    var inspected = 0;
+    while (inspected < 500 && (match = regex.exec(page.html)) !== null) {
+      inspected++;
+      const profileUrl = normalizeSocialProfileUrl_(decodeHtmlEntities_(match[1]), 'INSTAGRAM');
+      if (!profileUrl) continue;
+      candidates.push({
+        url: profileUrl,
+        title: cleanText_(item.title),
+        description: cleanText_(item.description),
+        evidenceSource: evidenceUrl
+      });
+    }
+  });
+
+  return inferSocialProfile_(candidates, companyName, location, 'INSTAGRAM');
+}
+
+function isTrustedSocialEvidenceUrl_(url, officialDomain) {
+  const domain = getDomain_(url);
+  const rootDomain = getRegistrableDomain_(domain);
+  const officialRoot = getRegistrableDomain_(officialDomain);
+  if (!domain || !rootDomain) return false;
+  if (officialRoot && rootDomain === officialRoot) return true;
+  if (rootDomain === 'unirank.org') return true;
+  return /(?:^|\.)(?:go\.id|ac\.id|sch\.id|or\.id)$/i.test(domain);
 }
 
 function fetchPageHtml_(url, runId) {

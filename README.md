@@ -17,3 +17,4 @@ Created from gas-tools extension
 - Pencarian nama lengkap diprioritaskan sebelum fallback alias/stem.
 - Metadata structured output hanya dipakai jika didukung URL source/citation aktual.
 - Koneksi OpenAI sementara (`Address unavailable`, timeout, 429 rate limit, dan 5xx) memakai bounded exponential-backoff retry; error autentikasi dan quota tidak diulang.
+- Instagram memakai direct full-name search lalu fallback link extraction dari website resmi, domain pemerintah/pendidikan, atau direktori universitas tepercaya dengan full-identity support.
