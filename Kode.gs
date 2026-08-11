@@ -46,6 +46,9 @@ const EMAIL_VALIDATOR_CONFIG = Object.freeze({
   MAX_PAGES_TO_INSPECT: 5,
   OPENAI_MODEL: 'gpt-5.6-luna',
   OPENAI_SEARCH_CONTEXT_SIZE: 'medium',
+  OPENAI_FETCH_MAX_ATTEMPTS: 3,
+  OPENAI_FETCH_BASE_DELAY_MS: 1000,
+  OPENAI_FETCH_MAX_DELAY_MS: 10000,
   EMAIL_CACHE_MAX_AGE_DAYS: 30,
   COMPANY_CACHE_MAX_AGE_DAYS: 90,
   API_KEY_PROPERTY: 'OPENAI_API_KEY',
@@ -2311,6 +2314,83 @@ function lookupMx_(domain, runId) {
   return { hasMx: records.length > 0, records: records };
 }
 
+function fetchOpenAIResponseWithRetry_(url, options, runId) {
+  const maxAttempts = Math.max(1, Number(EMAIL_VALIDATOR_CONFIG.OPENAI_FETCH_MAX_ATTEMPTS) || 1);
+  var lastTransportError = null;
+
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+    assertBatchRunActive_(runId);
+    try {
+      const response = UrlFetchApp.fetch(url, options);
+      assertBatchRunActive_(runId);
+
+      if (!isRetryableOpenAIResponse_(response) || attempt >= maxAttempts) return response;
+      sleepBeforeOpenAIRetry_(attempt, getOpenAIRetryAfterMs_(response), runId);
+    } catch (error) {
+      if (isBatchStoppedError_(error)) throw error;
+      if (!isRetryableOpenAITransportError_(error)) throw error;
+
+      lastTransportError = error;
+      if (attempt >= maxAttempts) {
+        throw new Error(
+          'OpenAI Web Search tidak dapat dijangkau setelah ' + maxAttempts +
+          ' percobaan: ' + truncate_(getErrorMessage_(lastTransportError), 350)
+        );
+      }
+      sleepBeforeOpenAIRetry_(attempt, 0, runId);
+    }
+  }
+
+  throw lastTransportError || new Error('OpenAI Web Search gagal tanpa response.');
+}
+
+function isRetryableOpenAIResponse_(response) {
+  const code = Number(response && response.getResponseCode ? response.getResponseCode() : 0);
+  if ([408, 409, 425, 500, 502, 503, 504].indexOf(code) !== -1) return true;
+  if (code !== 429) return false;
+
+  // Limit billing/quota tidak pulih dengan retry. Rate limit sementara boleh.
+  const body = response && response.getContentText ? cleanText_(response.getContentText()) : '';
+  return !/(insufficient_quota|organization_spend_limit_exceeded|project_spend_limit_exceeded|organization_usage_limit_exceeded)/i.test(body);
+}
+
+function isRetryableOpenAITransportError_(error) {
+  const message = getErrorMessage_(error).toLowerCase();
+  return /(alamat tidak tersedia|address unavailable|timed?\s*out|timeout|connection|network|socket|dns|ssl|temporar(?:y|ily)|service unavailable)/i.test(message);
+}
+
+function getOpenAIRetryAfterMs_(response) {
+  if (!response) return 0;
+  var headers = {};
+  try {
+    headers = response.getAllHeaders ? response.getAllHeaders() : response.getHeaders();
+  } catch (error) { headers = {}; }
+
+  var value = '';
+  Object.keys(headers || {}).some(function (key) {
+    if (String(key).toLowerCase() !== 'retry-after') return false;
+    value = Array.isArray(headers[key]) ? headers[key][0] : headers[key];
+    return true;
+  });
+  if (value === '' || value === null || typeof value === 'undefined') return 0;
+
+  const seconds = Number(value);
+  if (isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const retryDate = new Date(value);
+  return isNaN(retryDate.getTime()) ? 0 : Math.max(0, retryDate.getTime() - Date.now());
+}
+
+function sleepBeforeOpenAIRetry_(attempt, retryAfterMs, runId) {
+  const base = Math.max(100, Number(EMAIL_VALIDATOR_CONFIG.OPENAI_FETCH_BASE_DELAY_MS) || 1000);
+  const maxDelay = Math.max(base, Number(EMAIL_VALIDATOR_CONFIG.OPENAI_FETCH_MAX_DELAY_MS) || 10000);
+  const exponential = base * Math.pow(2, Math.max(0, Number(attempt) - 1));
+  const jitter = Math.floor(Math.random() * 251);
+  const delay = Math.min(maxDelay, Math.max(Number(retryAfterMs) || 0, exponential + jitter));
+  assertBatchRunActive_(runId);
+  Utilities.sleep(delay);
+  assertBatchRunActive_(runId);
+}
+
 function openAIWebSearch_(query, runId) {
   assertBatchRunActive_(runId);
   const apiKey = assertValidatorApiKey_();
@@ -2374,7 +2454,7 @@ function openAIWebSearch_(query, runId) {
     }
   };
 
-  const response = UrlFetchApp.fetch(url, {
+  const response = fetchOpenAIResponseWithRetry_(url, {
     method: 'post',
     contentType: 'application/json',
     headers: {
@@ -2384,7 +2464,7 @@ function openAIWebSearch_(query, runId) {
     payload: JSON.stringify(body),
     muteHttpExceptions: true,
     followRedirects: true
-  });
+  }, runId);
 
   assertBatchRunActive_(runId);
   const code = response.getResponseCode();

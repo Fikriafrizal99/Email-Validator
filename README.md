@@ -16,3 +16,4 @@ Created from gas-tools extension
 - Respons web search `incomplete` atau URL tanpa source tidak lagi disimpan sebagai `NOT_FOUND`.
 - Pencarian nama lengkap diprioritaskan sebelum fallback alias/stem.
 - Metadata structured output hanya dipakai jika didukung URL source/citation aktual.
+- Koneksi OpenAI sementara (`Address unavailable`, timeout, 429 rate limit, dan 5xx) memakai bounded exponential-backoff retry; error autentikasi dan quota tidak diulang.
