@@ -1,6 +1,13 @@
 # Email-Validator
 Created from gas-tools extension
 
+## Changelog v3.3.6
+
+- Official Website wajib memiliki stem/alias domain yang mendukung identitas perusahaan; direktori, peta, media, job board, dan agregator tidak lagi mendapat status `MATCH` hanya karena menyebut nama perusahaan.
+- Social link yang diekstrak dari website divalidasi ulang terhadap slug/alias perusahaan, dan alias singkat LinkedIn maupun Instagram memerlukan konteks nama lengkap.
+- AHU menolak landing/search page generik, URL reCAPTCHA, nama badan hukum boilerplate, dan klaim direct/parent tanpa nama entitas serta sinyal record yang konkret.
+- Cache Company Master dan Email Validation Raw sebelum 3.3.6 ditandai stale satu kali tanpa menghapus atau memindahkan data lama; `Manual Lock=YES` tetap dipertahankan.
+
 ## Changelog v3.3.5
 
 - Resolver website resmi memprioritaskan root domain dan tetap memakai subdomain kampanye sebagai evidence.
