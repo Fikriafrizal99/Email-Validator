@@ -7,7 +7,7 @@
       "name": "Manual Trigger",
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
-      "position": [528, 560]
+      "position": [480, 560]
     },
     {
       "parameters": {
@@ -24,7 +24,7 @@
       "name": "Daily Schedule - 18:00 WIB",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [528, 336]
+      "position": [480, 336]
     },
     {
       "parameters": {
@@ -62,7 +62,7 @@
       "name": "Config",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
-      "position": [768, 432]
+      "position": [720, 432]
     },
     {
       "parameters": {
@@ -75,11 +75,11 @@
         "jsonBody": "={{ { function: 'startEmailValidatorN8n', parameters: [$('Config').item.json.spreadsheetId] } }}",
         "options": {}
       },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.5,
-      "position": [1008, 432],
       "id": "85598d20-3d54-40d5-8c4b-4f0781aa0369",
       "name": "Start Email Validator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [960, 432],
       "credentials": {
         "oAuth2Api": {
           "id": "c8RsEiPHO2rjIdey",
@@ -89,13 +89,13 @@
     },
     {
       "parameters": {
-        "jsCode": "const r = $json?.response?.result ?? $json;\nconst status = String(r.status || 'UNKNOWN').toUpperCase();\n\nreturn [{\n  json: {\n    ...r,\n    status,\n    isDone: status === 'DONE',\n    isError: ['ERROR', 'FAILED', 'STOPPED'].includes(status)\n  }\n}];"
+        "jsCode": "const r = $json?.response?.result ?? $json;\nconst status = String(r.status || 'UNKNOWN').toUpperCase();\nreturn [{ json: { ...r, status, isDone: status === 'DONE', isError: ['ERROR','FAILED','STOPPED'].includes(status) } }];"
       },
       "id": "e2b34c20-673c-4a6d-ad24-586cf6fe5df5",
-      "name": "Normalize Result",
+      "name": "Normalize Start Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1248, 432]
+      "position": [1200, 432]
     },
     {
       "parameters": {
@@ -108,7 +108,7 @@
           },
           "conditions": [
             {
-              "id": "error-cond",
+              "id": "start-error-cond",
               "leftValue": "={{ $json.isError }}",
               "rightValue": true,
               "operator": {
@@ -123,10 +123,10 @@
         "options": {}
       },
       "id": "2b7d0a3e-1382-4459-8bbd-d4a7d5892f72",
-      "name": "Error?",
+      "name": "Start Error?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [1488, 432]
+      "position": [1440, 432]
     },
     {
       "parameters": {
@@ -139,7 +139,7 @@
           },
           "conditions": [
             {
-              "id": "done-cond",
+              "id": "start-done-cond",
               "leftValue": "={{ $json.isDone }}",
               "rightValue": true,
               "operator": {
@@ -154,10 +154,31 @@
         "options": {}
       },
       "id": "85062698-73a0-4ce4-a27e-1f94461b7486",
-      "name": "Done?",
+      "name": "Start Done?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [1728, 496]
+      "position": [1680, 496]
+    },
+    {
+      "parameters": {
+        "jsCode": "const endRow = Number($json.endRow || 0);\nconst nextRow = Number($json.nextRow || 0);\nconst batchSize = 5;\n\nlet maxIterations;\nif (endRow > 0 && nextRow > 0) {\n  const remainingRows = Math.max(0, endRow - nextRow + 1);\n  maxIterations = Math.max(1, Math.ceil(remainingRows / batchSize) + 2);\n} else {\n  maxIterations = 25;\n}\n\nreturn Array.from({ length: maxIterations }, (_, i) => ({\n  json: {\n    iteration: i + 1,\n    maxIterations,\n    runId: $json.runId || ''\n  }\n}));"
+      },
+      "id": "06dcd1d6-eef7-4c52-98bc-b3b75d81e52a",
+      "name": "Build Batch Queue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1920, 592]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "7f7e2b4b-c2c7-44de-9c44-ef5b63d08d7c",
+      "name": "Loop Continue Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [2160, 592]
     },
     {
       "parameters": {
@@ -170,17 +191,99 @@
         "jsonBody": "={{ { function: 'continueEmailValidatorN8n', parameters: [] } }}",
         "options": {}
       },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.5,
-      "position": [1968, 592],
       "id": "4ce9bd03-2d9e-466e-bc3a-4d39abf0b21a",
       "name": "Continue Email Validator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [2400, 672],
       "credentials": {
         "oAuth2Api": {
           "id": "c8RsEiPHO2rjIdey",
           "name": "Email Validator AppScript"
         }
       }
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json?.response?.result ?? $json;\nconst status = String(r.status || 'UNKNOWN').toUpperCase();\nreturn [{ json: { ...r, status, isDone: status === 'DONE', isError: ['ERROR','FAILED','STOPPED'].includes(status) } }];"
+      },
+      "id": "b15bb6f6-c9cb-463a-8906-dfd6b1b05968",
+      "name": "Normalize Continue Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2640, 672]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cont-error-cond",
+              "leftValue": "={{ $json.isError }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e8925f75-38d0-4775-b8ad-0b53c6ae7c8e",
+      "name": "Continue Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2880, 672]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cont-done-cond",
+              "leftValue": "={{ $json.isDone }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "49424f14-714b-4e65-88c8-cdfdaed343d9",
+      "name": "Continue Done?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [3120, 736]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ok: false, status: 'ERROR', error: 'Batas batch n8n habis sebelum Email Validator mengembalikan DONE. Jalankan ulang setelah mengecek status.', runId: $('Normalize Start Result').first().json.runId || '' } }];"
+      },
+      "id": "4352f241-3bfd-41e2-8b18-cb43aeb9f960",
+      "name": "Loop Exhausted",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2400, 480]
     },
     {
       "parameters": {
@@ -196,7 +299,7 @@
       "name": "Telegram Success",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.5,
-      "position": [1968, 352]
+      "position": [3360, 544]
     },
     {
       "parameters": {
@@ -212,19 +315,19 @@
       "name": "Telegram Failed",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.5,
-      "position": [1728, 272]
+      "position": [3360, 864]
     },
     {
       "parameters": {
-        "content": "## Email Validator — Daily OAuth\\n- Otomatis 1× sehari pukul **18:00 WIB**. Ubah node `Daily Schedule - 18:00 WIB` jika ingin jam lain.\\n- Tidak ada polling/wait 60 detik. Setelah Start, n8n memanggil `continueEmailValidatorN8n()` berulang sampai `DONE`.\\n- OAuth: credential `Email Validator AppScript`.\\n- Isi `telegramBotToken` di node Config dengan token BARU. Token lama yang pernah disimpan di repo harus di-revoke.\\n- Spreadsheet ID sudah diarahkan ke Job Board saat ini.",
+        "content": "## Email Validator — Daily OAuth\n- Otomatis 1× sehari pukul **18:00 WIB**.\n- Batch lanjutan memakai **Loop Over Items** agar benar-benar dieksekusi berulang secara serial.\n- Tidak ada Wait 60 detik.\n- OAuth: credential `Email Validator AppScript`.\n- Isi `telegramBotToken` di Config dengan token BARU.\n- Manual Trigger tetap tersedia untuk testing.",
         "height": 260,
-        "width": 520
+        "width": 560
       },
       "id": "ac222344-9486-43e7-8be5-70d6d48d44aa",
       "name": "Setup Notes",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [512, 80]
+      "position": [480, 80]
     }
   ],
   "pinData": {},
@@ -239,25 +342,52 @@
       "main": [[{"node":"Start Email Validator","type":"main","index":0}]]
     },
     "Start Email Validator": {
-      "main": [[{"node":"Normalize Result","type":"main","index":0}]]
+      "main": [[{"node":"Normalize Start Result","type":"main","index":0}]]
     },
-    "Normalize Result": {
-      "main": [[{"node":"Error?","type":"main","index":0}]]
+    "Normalize Start Result": {
+      "main": [[{"node":"Start Error?","type":"main","index":0}]]
     },
-    "Error?": {
+    "Start Error?": {
       "main": [
         [{"node":"Telegram Failed","type":"main","index":0}],
-        [{"node":"Done?","type":"main","index":0}]
+        [{"node":"Start Done?","type":"main","index":0}]
       ]
     },
-    "Done?": {
+    "Start Done?": {
       "main": [
         [{"node":"Telegram Success","type":"main","index":0}],
+        [{"node":"Build Batch Queue","type":"main","index":0}]
+      ]
+    },
+    "Build Batch Queue": {
+      "main": [[{"node":"Loop Continue Batches","type":"main","index":0}]]
+    },
+    "Loop Continue Batches": {
+      "main": [
+        [{"node":"Loop Exhausted","type":"main","index":0}],
         [{"node":"Continue Email Validator","type":"main","index":0}]
       ]
     },
     "Continue Email Validator": {
-      "main": [[{"node":"Normalize Result","type":"main","index":0}]]
+      "main": [[{"node":"Normalize Continue Result","type":"main","index":0}]]
+    },
+    "Normalize Continue Result": {
+      "main": [[{"node":"Continue Error?","type":"main","index":0}]]
+    },
+    "Continue Error?": {
+      "main": [
+        [{"node":"Telegram Failed","type":"main","index":0}],
+        [{"node":"Continue Done?","type":"main","index":0}]
+      ]
+    },
+    "Continue Done?": {
+      "main": [
+        [{"node":"Telegram Success","type":"main","index":0}],
+        [{"node":"Loop Continue Batches","type":"main","index":0}]
+      ]
+    },
+    "Loop Exhausted": {
+      "main": [[{"node":"Telegram Failed","type":"main","index":0}]]
     }
   },
   "active": false,
@@ -267,7 +397,7 @@
     "availableInMCP": false,
     "timezone": "Asia/Jakarta"
   },
-  "versionId": "4f3f50d1-f154-4812-b2f4-600421534842",
+  "versionId": "4a039429-d99e-493a-8089-1cf36b445d2f",
   "meta": {
     "instanceId": "ad1f0c6658d383104eabd3878f3aa6086a990e40d0c61a955e6306422a1e08a8"
   },
