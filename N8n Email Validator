@@ -1,5 +1,5 @@
 {
-  "name": "Email Validator Apps Script Orchestrator",
+  "name": "Email Validator Apps Script Orchestrator - Daily OAuth",
   "nodes": [
     {
       "parameters": {},
@@ -7,31 +7,45 @@
       "name": "Manual Trigger",
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
-      "position": [
-        528,
-        432
-      ]
+      "position": [528, 560]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 18 * * *"
+            }
+          ]
+        }
+      },
+      "id": "ccf8e680-79e5-4d23-b98e-6df1453f98e1",
+      "name": "Daily Schedule - 18:00 WIB",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [528, 336]
     },
     {
       "parameters": {
         "assignments": {
           "assignments": [
             {
-              "id": "cfg-url",
-              "name": "appsScriptUrl",
-              "value": "https://script.google.com/a/macros/kitalulus.com/s/AKfycbxoQvhC-Qz1VHOswMChOe7IQijOhhFBKnDpgY0UsEhCja054hiBH1etHxbNtPHkn_JfTQ/exec",
+              "id": "cfg-script-url",
+              "name": "appsScriptRunUrl",
+              "value": "https://script.googleapis.com/v1/scripts/AKfycbwLvsPkQFSNQo5ypp-hcseFMZqFrqC9MQfTs3HHAaFZwY5UlOX8XimJI7l4DSNK8S63mw:run",
               "type": "string"
             },
             {
-              "id": "cfg-secret",
-              "name": "apiSecret",
-              "value": "email-validatorv2",
+              "id": "cfg-sheet",
+              "name": "spreadsheetId",
+              "value": "1IZPNfM_74XbH4E24YTJTjN9PEYLKBBWwBzKNEsTrh8c",
               "type": "string"
             },
             {
               "id": "cfg-token",
               "name": "telegramBotToken",
-              "value": "8825358411:AAHhOhqwxk6mYesQ0qjLIwBW3tmaEOiPSdU",
+              "value": "PASTE_NEW_TELEGRAM_BOT_TOKEN",
               "type": "string"
             },
             {
@@ -39,18 +53,6 @@
               "name": "telegramChatId",
               "value": "1111319830",
               "type": "string"
-            },
-            {
-              "id": "cfg-wait",
-              "name": "pollWaitSeconds",
-              "value": 60,
-              "type": "number"
-            },
-            {
-              "id": "cfg-max",
-              "name": "maxPolls",
-              "value": 10,
-              "type": "number"
             }
           ]
         },
@@ -60,81 +62,71 @@
       "name": "Config",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
-      "position": [
-        752,
-        432
-      ]
+      "position": [768, 432]
     },
     {
       "parameters": {
-        "jsCode": "const r = $json || {};\nconst cfg = $('Config').first().json;\n\nif (!r.ok) {\n  throw new Error(r.error || 'Apps Script gagal memulai Email Validator');\n}\n\nreturn [{\n  json: {\n    runId: r.runId || '',\n    status: r.status || 'STARTED',\n    pollCount: 0,\n    maxPolls: Number(cfg.maxPolls || 10),\n    pollWaitSeconds: Number(cfg.pollWaitSeconds || 60)\n  }\n}];"
+        "method": "POST",
+        "url": "={{ $('Config').item.json.appsScriptRunUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { function: 'startEmailValidatorN8n', parameters: [$('Config').item.json.spreadsheetId] } }}",
+        "options": {}
       },
-      "id": "27856dcd-ab77-4f94-b955-f8e382a96fdb",
-      "name": "Init Polling",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [1008, 432],
+      "id": "85598d20-3d54-40d5-8c4b-4f0781aa0369",
+      "name": "Start Email Validator",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "c8RsEiPHO2rjIdey",
+          "name": "Email Validator AppScript"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json?.response?.result ?? $json;\nconst status = String(r.status || 'UNKNOWN').toUpperCase();\n\nreturn [{\n  json: {\n    ...r,\n    status,\n    isDone: status === 'DONE',\n    isError: ['ERROR', 'FAILED', 'STOPPED'].includes(status)\n  }\n}];"
+      },
+      "id": "e2b34c20-673c-4a6d-ad24-586cf6fe5df5",
+      "name": "Normalize Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [
-        1456,
-        432
-      ]
+      "position": [1248, 432]
     },
     {
       "parameters": {
-        "amount": "={{ $json.pollWaitSeconds }}"
-      },
-      "id": "1676f4f2-7f9a-45a8-b57b-819a5e91e52d",
-      "name": "Wait Before Status Check",
-      "type": "n8n-nodes-base.wait",
-      "typeVersion": 1.1,
-      "position": [
-        1696,
-        432
-      ],
-      "webhookId": "72d5cf51-4b4a-44c5-b2c3-b7a469efcc58"
-    },
-    {
-      "parameters": {
-        "url": "={{ $('Config').item.json.appsScriptUrl }}",
-        "sendQuery": true,
-        "queryParameters": {
-          "parameters": [
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
             {
-              "name": "action",
-              "value": "status"
-            },
-            {
-              "name": "runId",
-              "value": "={{ $json.runId }}"
-            },
-            {
-              "name": "secret",
-              "value": "={{ $('Config').item.json.apiSecret }}"
+              "id": "error-cond",
+              "leftValue": "={{ $json.isError }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
             }
-          ]
+          ],
+          "combinator": "and"
         },
         "options": {}
       },
-      "id": "2a53ae60-e27b-45fd-8c59-24b2555fdafe",
-      "name": "Check Validator Status",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        1936,
-        432
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "const prev = $('Wait Before Status Check').item.json;\nconst r = $json || {};\n\nconst status = String(r.status || 'UNKNOWN').toUpperCase();\nconst pollCount = Number(prev.pollCount || 0) + 1;\nconst maxPolls = Number(prev.maxPolls || 10);\n\nreturn [{\n  json: {\n    ...prev,\n    ...r,\n    status,\n    pollCount,\n    maxPolls,\n    done: ['DONE', 'COMPLETED', 'SUCCESS'].includes(status),\n    failed: ['FAILED', 'ERROR', 'STOPPED'].includes(status),\n    timedOut: pollCount >= maxPolls && !['DONE', 'COMPLETED', 'SUCCESS'].includes(status)\n  }\n}];"
-      },
-      "id": "cc90eb0f-fdf1-4a25-9159-fda615c507bd",
-      "name": "Evaluate Status",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        2176,
-        432
-      ]
+      "id": "2b7d0a3e-1382-4459-8bbd-d4a7d5892f72",
+      "name": "Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1488, 432]
     },
     {
       "parameters": {
@@ -148,7 +140,7 @@
           "conditions": [
             {
               "id": "done-cond",
-              "leftValue": "={{ $json.done }}",
+              "leftValue": "={{ $json.isDone }}",
               "rightValue": true,
               "operator": {
                 "type": "boolean",
@@ -165,281 +157,117 @@
       "name": "Done?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [
-        2416,
-        432
-      ]
+      "position": [1728, 496]
     },
     {
       "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "stop-cond-1",
-              "leftValue": "={{ $json.failed }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "true",
-                "singleValue": true
-              }
-            },
-            {
-              "id": "stop-cond-2",
-              "leftValue": "={{ $json.timedOut }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "true",
-                "singleValue": true
-              }
-            }
-          ],
-          "combinator": "or"
-        },
+        "method": "POST",
+        "url": "={{ $('Config').item.json.appsScriptRunUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { function: 'continueEmailValidatorN8n', parameters: [] } }}",
         "options": {}
       },
-      "id": "4a0e9fea-fe9e-4978-ad80-21e9f2919c13",
-      "name": "Failed or Timeout?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        2640,
-        528
-      ]
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [1968, 592],
+      "id": "4ce9bd03-2d9e-466e-bc3a-4d39abf0b21a",
+      "name": "Continue Email Validator",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "c8RsEiPHO2rjIdey",
+          "name": "Email Validator AppScript"
+        }
+      }
     },
     {
       "parameters": {
         "method": "POST",
         "url": "=https://api.telegram.org/bot{{ $('Config').item.json.telegramBotToken }}/sendMessage",
         "sendBody": true,
-        "bodyParameters": {
-          "parameters": [
-            {}
-          ]
-        },
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { chat_id: $('Config').item.json.telegramChatId, text: `📧 EMAIL VALIDATOR SELESAI\\n━━━━━━━━━━━━━━━━\\nRun ID: ${$json.runId || '-'}\\nDiproses: ${$json.processed ?? 0}\\n✅ Terverifikasi: ${$json.validConfirmed ?? 0}\\n🟢 Kemungkinan valid: ${$json.validProbable ?? 0}\\n🟡 Cek manual: ${$json.review ?? 0}\\n❌ Jangan digunakan: ${$json.invalid ?? 0}\\n⚠️ Error: ${$json.errors ?? 0}\\n\\nStatus: ${$json.status || 'DONE'}` } }}",
         "options": {}
       },
       "id": "4f6484c7-ffe7-4027-9fde-334be78c68a5",
       "name": "Telegram Success",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        2656,
-        272
-      ]
+      "typeVersion": 4.5,
+      "position": [1968, 352]
     },
     {
       "parameters": {
         "method": "POST",
         "url": "=https://api.telegram.org/bot{{ $('Config').item.json.telegramBotToken }}/sendMessage",
         "sendBody": true,
-        "bodyParameters": {
-          "parameters": [
-            {}
-          ]
-        },
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { chat_id: $('Config').item.json.telegramChatId, text: `⚠️ EMAIL VALIDATOR GAGAL\\n━━━━━━━━━━━━━━━━\\nRun ID: ${$json.runId || '-'}\\nStatus: ${$json.status || 'ERROR'}\\nError: ${$json.error || 'Unknown error'}` } }}",
         "options": {}
       },
       "id": "94e75a63-7fe4-4bc4-8030-d5a873f5827f",
       "name": "Telegram Failed",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        2880,
-        528
-      ]
+      "typeVersion": 4.5,
+      "position": [1728, 272]
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "https://script.googleapis.com/v1/scripts/AKfycbwLvsPkQFSNQo5ypp-hcseFMZqFrqC9MQfTs3HHAaFZwY5UlOX8XimJI7l4DSNK8S63mw:run",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "oAuth2Api",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "{\n  \"function\": \"getEmailValidatorStatusN8n\",\n  \"parameters\": []\n}",
-        "options": {}
+        "content": "## Email Validator — Daily OAuth\\n- Otomatis 1× sehari pukul **18:00 WIB**. Ubah node `Daily Schedule - 18:00 WIB` jika ingin jam lain.\\n- Tidak ada polling/wait 60 detik. Setelah Start, n8n memanggil `continueEmailValidatorN8n()` berulang sampai `DONE`.\\n- OAuth: credential `Email Validator AppScript`.\\n- Isi `telegramBotToken` di node Config dengan token BARU. Token lama yang pernah disimpan di repo harus di-revoke.\\n- Spreadsheet ID sudah diarahkan ke Job Board saat ini.",
+        "height": 260,
+        "width": 520
       },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.5,
-      "position": [
-        976,
-        432
-      ],
-      "id": "fc2a0626-db1e-4aa7-ad27-f623e73115c9",
-      "name": "HTTP Request",
-      "credentials": {
-        "googleAnalyticsOAuth2": {
-          "id": "xj72ab8QKP5Owxqv",
-          "name": "Google Analytics account"
-        },
-        "oAuth2Api": {
-          "id": "c8RsEiPHO2rjIdey",
-          "name": "Email Validator AppScript"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://script.googleapis.com/v1/scripts/AKfycbwLvsPkQFSNQo5ypp-hcseFMZqFrqC9MQfTs3HHAaFZwY5UlOX8XimJI7l4DSNK8S63mw:run",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "oAuth2Api",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "{\n  \"function\": \"startEmailValidatorN8n\",\n  \"parameters\": [\n    \"1IZPNfM_74XbH4E24YTJTjN9PEYLKBBWwBzKNEsTrh8c\"\n  ]\n}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.5,
-      "position": [
-        1216,
-        432
-      ],
-      "id": "85598d20-3d54-40d5-8c4b-4f0781aa0369",
-      "name": "Start Email Validator",
-      "credentials": {
-        "googleAnalyticsOAuth2": {
-          "id": "xj72ab8QKP5Owxqv",
-          "name": "Google Analytics account"
-        },
-        "oAuth2Api": {
-          "id": "c8RsEiPHO2rjIdey",
-          "name": "Email Validator AppScript"
-        }
-      }
+      "id": "ac222344-9486-43e7-8be5-70d6d48d44aa",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [512, 80]
     }
   ],
   "pinData": {},
   "connections": {
     "Manual Trigger": {
-      "main": [
-        [
-          {
-            "node": "Config",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{"node":"Config","type":"main","index":0}]]
+    },
+    "Daily Schedule - 18:00 WIB": {
+      "main": [[{"node":"Config","type":"main","index":0}]]
     },
     "Config": {
-      "main": [
-        [
-          {
-            "node": "HTTP Request",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+      "main": [[{"node":"Start Email Validator","type":"main","index":0}]]
     },
-    "Init Polling": {
-      "main": [
-        [
-          {
-            "node": "Wait Before Status Check",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+    "Start Email Validator": {
+      "main": [[{"node":"Normalize Result","type":"main","index":0}]]
     },
-    "Wait Before Status Check": {
-      "main": [
-        [
-          {
-            "node": "Check Validator Status",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+    "Normalize Result": {
+      "main": [[{"node":"Error?","type":"main","index":0}]]
     },
-    "Check Validator Status": {
+    "Error?": {
       "main": [
-        [
-          {
-            "node": "Evaluate Status",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Evaluate Status": {
-      "main": [
-        [
-          {
-            "node": "Done?",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{"node":"Telegram Failed","type":"main","index":0}],
+        [{"node":"Done?","type":"main","index":0}]
       ]
     },
     "Done?": {
       "main": [
-        [
-          {
-            "node": "Telegram Success",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Failed or Timeout?",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{"node":"Telegram Success","type":"main","index":0}],
+        [{"node":"Continue Email Validator","type":"main","index":0}]
       ]
     },
-    "Failed or Timeout?": {
-      "main": [
-        [
-          {
-            "node": "Telegram Failed",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Wait Before Status Check",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "HTTP Request": {
-      "main": [
-        [
-          {
-            "node": "Start Email Validator",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+    "Continue Email Validator": {
+      "main": [[{"node":"Normalize Result","type":"main","index":0}]]
     }
   },
   "active": false,
   "settings": {
     "executionOrder": "v1",
     "binaryMode": "separate",
-    "availableInMCP": false
+    "availableInMCP": false,
+    "timezone": "Asia/Jakarta"
   },
-  "versionId": "8ff3424b-16c0-49ba-9be4-c4da790c6623",
+  "versionId": "4f3f50d1-f154-4812-b2f4-600421534842",
   "meta": {
     "instanceId": "ad1f0c6658d383104eabd3878f3aa6086a990e40d0c61a955e6306422a1e08a8"
   },
