@@ -10,19 +10,23 @@
  * Catatan:
  * - Tidak memakai doGet/doPost atau shared secret.
  * - Autentikasi ditangani Google OAuth2.
- * - n8n menjadi orchestrator batch: setiap polling memproses maksimal BATCH_SIZE.
+ * - n8n menjadi orchestrator batch.
+ * - Jalur n8n memproses maksimal 1 email baru per request agar koneksi HTTP pendek/stabil.
+ * - Company + email yang cache-nya masih valid langsung dilewati, walaupun pindah Source Row.
+ * - Company yang sama dengan email baru tetap divalidasi, tetapi memakai Company Master sebagai cache perusahaan.
  * - Adapter ini sengaja tidak membuat Apps Script trigger dari scripts.run.
- * - Engine validasi utama tetap memakai helper yang sama dengan Kode.gs.
  */
 
 const N8N_LAST_RUN_ID_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_RUN_ID';
 const N8N_LAST_SPREADSHEET_ID_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_SPREADSHEET_ID';
 const N8N_LAST_RESULT_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_RESULT';
 const N8N_LAST_STARTED_AT_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_STARTED_AT';
+const N8N_BATCH_SIZE_ = 1;
 
 /**
  * Memulai validasi seluruh email baru dari n8n.
  * Spreadsheet ID wajib dikirim karena scripts.run tidak memiliki active spreadsheet.
+ * Start hanya membuat state; pekerjaan berat dilakukan oleh continueEmailValidatorN8n().
  */
 function startEmailValidatorN8n(spreadsheetId) {
   assertValidatorApiKey_();
@@ -110,12 +114,11 @@ function startEmailValidatorN8n(spreadsheetId) {
   props.setProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY, id);
   props.setProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY, JSON.stringify(state));
 
-  processEmailValidatorN8nBatch_();
-  return getEmailValidatorStatusN8n();
+  return buildN8nStatusFromState_(state, 'RUNNING');
 }
 
 /**
- * Dipanggil n8n setelah Wait. Memproses satu batch berikutnya lalu mengembalikan status.
+ * Memproses satu batch n8n berikutnya lalu mengembalikan status.
  */
 function continueEmailValidatorN8n() {
   const props = PropertiesService.getScriptProperties();
@@ -188,13 +191,34 @@ function getEmailValidatorStatusN8n() {
 }
 
 /**
+ * Filter khusus n8n.
+ * Mode normal melewati company+email yang sudah memiliki Email Cache valid,
+ * walaupun data harian pindah nomor row. RETRY tetap mengikuti engine utama.
+ */
+function shouldProcessValidationRowN8n_(sourceRow, rowValues, headerMap, rawIndex, mode) {
+  const company = cleanText_(rowValues[headerMap['Company Name'] - 1]);
+  const type = cleanText_(rowValues[headerMap['Contact Type'] - 1]).toUpperCase();
+  const email = normalizeEmail_(rowValues[headerMap['Contact'] - 1]);
+
+  if (!company || type !== 'EMAIL' || !email) return false;
+
+  if (mode !== 'RETRY') {
+    const validationKey = makeValidationKey_(company, email);
+    const cached = rawIndex.byValidationKey[validationKey];
+    if (cached && isUsableEmailCache_(cached)) return false;
+  }
+
+  return shouldProcessValidationRow_(sourceRow, rowValues, headerMap, rawIndex, mode);
+}
+
+/**
  * Versi satu-batch untuk eksekusi melalui Apps Script API.
  * Tidak membuat continuation trigger; continuation dilakukan oleh n8n.
  */
 function processEmailValidatorN8nBatch_() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
-    throw new Error('Email Validator sedang diproses oleh eksekusi lain. Coba lagi pada polling berikutnya.');
+    throw new Error('Email Validator sedang diproses oleh eksekusi lain. Coba lagi pada batch berikutnya.');
   }
 
   var runId = '';
@@ -251,10 +275,11 @@ function processEmailValidatorN8nBatch_() {
       EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW
     );
 
-    while (scanRow <= lastRow && rowsToProcess.length < EMAIL_VALIDATOR_CONFIG.BATCH_SIZE) {
+    while (scanRow <= lastRow && rowsToProcess.length < N8N_BATCH_SIZE_) {
       assertBatchRunActive_(runId);
       const rowValues = values[scanRow - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW];
-      if (shouldProcessValidationRow_(scanRow, rowValues, sourceHeaderMap, rawIndex, state.mode)) {
+
+      if (shouldProcessValidationRowN8n_(scanRow, rowValues, sourceHeaderMap, rawIndex, state.mode)) {
         rowsToProcess.push(scanRow);
       } else {
         state.skipped++;
@@ -294,7 +319,9 @@ function processEmailValidatorN8nBatch_() {
     }
 
     if (!persistBatchStateIfActive_(state)) return;
-    updateSummarySheet_(ss);
+
+    // Tidak refresh Ringkasan setiap email. Ini mengurangi waktu request n8n.
+    // Ringkasan tetap diperbarui saat seluruh run selesai.
   } catch (error) {
     if (isBatchStoppedError_(error)) {
       deleteBatchStateIfRunMatches_(runId);
