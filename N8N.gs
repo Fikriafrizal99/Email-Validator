@@ -4,12 +4,15 @@
  *
  * Fungsi publik untuk n8n:
  * - startEmailValidatorN8n(spreadsheetId)
+ * - continueEmailValidatorN8n()
  * - getEmailValidatorStatusN8n()
  *
  * Catatan:
  * - Tidak memakai doGet/doPost atau shared secret.
  * - Autentikasi ditangani Google OAuth2.
- * - Engine Email Validator utama tetap menggunakan batch/trigger yang sudah ada.
+ * - n8n menjadi orchestrator batch: setiap polling memproses maksimal BATCH_SIZE.
+ * - Adapter ini sengaja tidak membuat Apps Script trigger dari scripts.run.
+ * - Engine validasi utama tetap memakai helper yang sama dengan Kode.gs.
  */
 
 const N8N_LAST_RUN_ID_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_RUN_ID';
@@ -19,15 +22,13 @@ const N8N_LAST_STARTED_AT_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_STARTED_AT';
 
 /**
  * Memulai validasi seluruh email baru dari n8n.
- * Wajib menerima Spreadsheet ID karena Apps Script API tidak memiliki active spreadsheet.
+ * Spreadsheet ID wajib dikirim karena scripts.run tidak memiliki active spreadsheet.
  */
 function startEmailValidatorN8n(spreadsheetId) {
   assertValidatorApiKey_();
 
   const id = cleanText_(spreadsheetId);
-  if (!id) {
-    throw new Error('Spreadsheet ID wajib dikirim dari n8n.');
-  }
+  if (!id) throw new Error('Spreadsheet ID wajib dikirim dari n8n.');
 
   const props = PropertiesService.getScriptProperties();
   const existingStateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
@@ -35,23 +36,23 @@ function startEmailValidatorN8n(spreadsheetId) {
     props.getProperty(EMAIL_VALIDATOR_CONFIG.ACTIVE_RUN_ID_PROPERTY)
   );
 
-  // Jangan timpa run yang masih aktif bila tombol/workflow terpanggil dua kali.
   if (existingStateText && existingRunId) {
     try {
       const existingState = JSON.parse(existingStateText);
       if (cleanText_(existingState.runId) === existingRunId && isBatchRunActive_(existingRunId)) {
+        if (cleanText_(existingState.controller).toUpperCase() !== 'N8N') {
+          throw new Error('Ada proses Email Validator non-n8n yang masih aktif. Hentikan atau tunggu sampai selesai.');
+        }
         return buildN8nStatusFromState_(existingState, 'RUNNING');
       }
-    } catch (ignore) {
-      // State rusak akan dibersihkan oleh start baru di bawah.
+    } catch (error) {
+      if (/non-n8n/i.test(getErrorMessage_(error))) throw error;
     }
   }
 
   const ss = SpreadsheetApp.openById(id);
   const sourceSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.JOB_SHEET_NAME);
-  if (!sourceSheet) {
-    throw new Error('Sheet "Job Board" tidak ditemukan.');
-  }
+  if (!sourceSheet) throw new Error('Sheet "Job Board" tidak ditemukan.');
 
   const headerMap = getHeaderMap_(sourceSheet);
   requireHeader_(headerMap, 'Company Name');
@@ -61,12 +62,13 @@ function startEmailValidatorN8n(spreadsheetId) {
 
   const endRow = getLastValidationDataRow_(sourceSheet, headerMap);
   const runId = Utilities.getUuid();
+  const startedAt = new Date().toISOString();
 
-  deleteValidatorContinuationTriggers_();
   props.deleteProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY);
   props.deleteProperty(N8N_LAST_RESULT_PROPERTY_);
   props.setProperty(N8N_LAST_RUN_ID_PROPERTY_, runId);
   props.setProperty(N8N_LAST_SPREADSHEET_ID_PROPERTY_, id);
+  props.setProperty(N8N_LAST_STARTED_AT_PROPERTY_, startedAt);
 
   if (endRow < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW) {
     const emptyResult = {
@@ -81,17 +83,16 @@ function startEmailValidatorN8n(spreadsheetId) {
       invalid: 0,
       errors: 0,
       message: 'Tidak ada data email yang perlu dipindai.',
+      startedAt: startedAt,
       finishedAt: new Date().toISOString()
     };
     props.setProperty(N8N_LAST_RESULT_PROPERTY_, JSON.stringify(emptyResult));
     return emptyResult;
   }
 
-  const startedAt = new Date().toISOString();
-  props.setProperty(N8N_LAST_STARTED_AT_PROPERTY_, startedAt);
-
   const state = {
     runId: runId,
+    controller: 'N8N',
     mode: 'PENDING',
     nextRow: EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
     endRow: endRow,
@@ -109,32 +110,41 @@ function startEmailValidatorN8n(spreadsheetId) {
   props.setProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY, id);
   props.setProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY, JSON.stringify(state));
 
-  // Jalankan batch pertama sekarang; batch berikutnya tetap diteruskan oleh trigger engine utama.
-  processEmailValidatorBatch();
-
+  processEmailValidatorN8nBatch_();
   return getEmailValidatorStatusN8n();
 }
 
 /**
- * Mengembalikan status batch yang dibaca oleh polling n8n.
+ * Dipanggil n8n setelah Wait. Memproses satu batch berikutnya lalu mengembalikan status.
+ */
+function continueEmailValidatorN8n() {
+  const props = PropertiesService.getScriptProperties();
+  const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+
+  if (!stateText) return getEmailValidatorStatusN8n();
+
+  const state = JSON.parse(stateText);
+  if (cleanText_(state.controller).toUpperCase() !== 'N8N') {
+    throw new Error('Batch aktif bukan batch yang dikendalikan n8n.');
+  }
+
+  processEmailValidatorN8nBatch_();
+  return getEmailValidatorStatusN8n();
+}
+
+/**
+ * Status read-only. Tidak memproses batch baru.
  */
 function getEmailValidatorStatusN8n() {
   const props = PropertiesService.getScriptProperties();
   const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
   const lastError = cleanText_(props.getProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY));
   const lastRunId = cleanText_(props.getProperty(N8N_LAST_RUN_ID_PROPERTY_));
-  const lastSpreadsheetId = cleanText_(props.getProperty(N8N_LAST_SPREADSHEET_ID_PROPERTY_));
-  const lastStartedAt = cleanText_(props.getProperty(N8N_LAST_STARTED_AT_PROPERTY_));
 
   if (stateText) {
     try {
       const state = JSON.parse(stateText);
-      const result = buildN8nStatusFromState_(state, 'RUNNING');
-
-      // Simpan snapshot terakhir agar ketika finishValidationBatch_ menghapus state,
-      // n8n masih mendapatkan statistik terakhir yang sempat terbaca.
-      props.setProperty(N8N_LAST_RESULT_PROPERTY_, JSON.stringify(result));
-      return result;
+      return buildN8nStatusFromState_(state, 'RUNNING');
     } catch (error) {
       return {
         ok: false,
@@ -154,33 +164,10 @@ function getEmailValidatorStatusN8n() {
     };
   }
 
-  // Jika batch state sudah dihapus oleh finishValidationBatch_, hitung hasil akhir
-  // dari Raw berdasarkan Last Checked sejak waktu run dimulai. Dengan begitu
-  // statistik final tetap akurat tanpa mengubah engine utama.
-  if (lastRunId && lastSpreadsheetId && lastStartedAt) {
-    try {
-      const finalResult = buildN8nFinalStatusFromRaw_(
-        lastSpreadsheetId,
-        lastRunId,
-        lastStartedAt
-      );
-      props.setProperty(N8N_LAST_RESULT_PROPERTY_, JSON.stringify(finalResult));
-      return finalResult;
-    } catch (error) {
-      // Jika pembacaan Raw gagal, fallback ke snapshot polling terakhir.
-      console.warn(getErrorMessage_(error));
-    }
-  }
-
   const lastResultText = props.getProperty(N8N_LAST_RESULT_PROPERTY_);
   if (lastResultText) {
     try {
-      const lastResult = JSON.parse(lastResultText);
-      lastResult.ok = true;
-      lastResult.runId = cleanText_(lastResult.runId) || lastRunId;
-      lastResult.status = 'DONE';
-      lastResult.finishedAt = lastResult.finishedAt || new Date().toISOString();
-      return lastResult;
+      return JSON.parse(lastResultText);
     } catch (ignore) {
       // fallback di bawah
     }
@@ -200,74 +187,153 @@ function getEmailValidatorStatusN8n() {
   };
 }
 
-function buildN8nFinalStatusFromRaw_(spreadsheetId, runId, startedAt) {
-  const ss = SpreadsheetApp.openById(spreadsheetId);
-  const rawSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.RAW_SHEET_NAME);
-  if (!rawSheet || rawSheet.getLastRow() < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW) {
-    return {
-      ok: true,
-      runId: runId,
-      status: 'DONE',
-      processed: 0,
-      skipped: 0,
-      validConfirmed: 0,
-      validProbable: 0,
-      review: 0,
-      invalid: 0,
-      errors: 0,
-      startedAt: startedAt,
-      finishedAt: new Date().toISOString()
-    };
+/**
+ * Versi satu-batch untuk eksekusi melalui Apps Script API.
+ * Tidak membuat continuation trigger; continuation dilakukan oleh n8n.
+ */
+function processEmailValidatorN8nBatch_() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    throw new Error('Email Validator sedang diproses oleh eksekusi lain. Coba lagi pada polling berikutnya.');
   }
 
-  const map = getHeaderMap_(rawSheet);
-  const statusCol = requireHeader_(map, 'Validation Status');
-  const checkedCol = requireHeader_(map, 'Last Checked');
-  const rowCount = rawSheet.getLastRow() - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW + 1;
-  const rows = rawSheet.getRange(
-    EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
-    1,
-    rowCount,
-    rawSheet.getLastColumn()
-  ).getValues();
+  var runId = '';
 
-  const startedMs = new Date(startedAt).getTime();
-  const result = {
-    ok: true,
-    runId: runId,
-    status: 'DONE',
-    processed: 0,
-    skipped: 0,
-    validConfirmed: 0,
-    validProbable: 0,
-    review: 0,
-    invalid: 0,
-    errors: 0,
-    startedAt: startedAt,
-    finishedAt: new Date().toISOString()
-  };
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+    if (!stateText) return;
 
-  rows.forEach(function (row) {
-    const checkedValue = row[checkedCol - 1];
-    const checkedMs = checkedValue instanceof Date
-      ? checkedValue.getTime()
-      : new Date(checkedValue).getTime();
-    if (!isFinite(checkedMs) || !isFinite(startedMs) || checkedMs < startedMs) return;
+    const state = JSON.parse(stateText);
+    runId = cleanText_(state.runId);
 
-    const technicalStatus = cleanText_(row[statusCol - 1]).toUpperCase();
-    if (!technicalStatus) return;
+    if (cleanText_(state.controller).toUpperCase() !== 'N8N') {
+      throw new Error('Batch aktif bukan batch yang dikendalikan n8n.');
+    }
 
-    result.processed++;
-    if (technicalStatus === 'ERROR') result.errors++;
+    assertBatchRunActive_(runId);
+    assertValidatorApiKey_();
 
-    const friendly = mapFinalStatus_(technicalStatus);
-    if (friendly === 'TERVERIFIKASI') result.validConfirmed++;
-    else if (friendly === 'KEMUNGKINAN VALID') result.validProbable++;
-    else if (friendly === 'CEK MANUAL') result.review++;
-    else if (friendly === 'JANGAN DIGUNAKAN') result.invalid++;
-  });
+    const spreadsheetId = props.getProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY);
+    if (!spreadsheetId) throw new Error('Spreadsheet ID proses tidak tersedia.');
 
-  return result;
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+    const sourceSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.JOB_SHEET_NAME);
+    if (!sourceSheet) throw new Error('Sheet "Job Board" tidak ditemukan.');
+
+    ensureWorkspace_(ss);
+
+    const rawIndex = loadRawIndex_(ensureRawSheet_(ss));
+    const sourceHeaderMap = getHeaderMap_(sourceSheet);
+    requireHeader_(sourceHeaderMap, 'Company Name');
+    requireHeader_(sourceHeaderMap, 'Contact Type');
+    requireHeader_(sourceHeaderMap, 'Contact');
+
+    const liveLastDataRow = getLastValidationDataRow_(sourceSheet, sourceHeaderMap);
+    const fixedEndRow = Number(state.endRow) || liveLastDataRow;
+    const lastRow = Math.min(fixedEndRow, liveLastDataRow);
+
+    if (lastRow < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW || state.nextRow > lastRow) {
+      finishEmailValidatorN8nBatch_(ss, state);
+      return;
+    }
+
+    const values = sourceSheet.getRange(
+      EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
+      1,
+      lastRow - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW + 1,
+      sourceSheet.getLastColumn()
+    ).getDisplayValues();
+
+    const rowsToProcess = [];
+    var scanRow = Math.max(
+      Number(state.nextRow) || EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
+      EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW
+    );
+
+    while (scanRow <= lastRow && rowsToProcess.length < EMAIL_VALIDATOR_CONFIG.BATCH_SIZE) {
+      assertBatchRunActive_(runId);
+      const rowValues = values[scanRow - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW];
+      if (shouldProcessValidationRow_(scanRow, rowValues, sourceHeaderMap, rawIndex, state.mode)) {
+        rowsToProcess.push(scanRow);
+      } else {
+        state.skipped++;
+      }
+      scanRow++;
+    }
+
+    if (rowsToProcess.length) {
+      const summary = processExplicitValidationRows_(
+        ss,
+        sourceSheet,
+        rowsToProcess,
+        state.mode === 'RETRY',
+        runId
+      );
+
+      if (summary.stopped) {
+        deleteBatchStateIfRunMatches_(runId);
+        return;
+      }
+
+      state.processed += summary.processed;
+      state.skipped += summary.skipped;
+      state.verified += summary.verified;
+      state.probable += summary.probable;
+      state.manual += summary.manual;
+      state.blocked += summary.blocked;
+      state.errors += summary.errors;
+    }
+
+    assertBatchRunActive_(runId);
+    state.nextRow = scanRow;
+
+    if (scanRow > lastRow) {
+      finishEmailValidatorN8nBatch_(ss, state);
+      return;
+    }
+
+    if (!persistBatchStateIfActive_(state)) return;
+    updateSummarySheet_(ss);
+  } catch (error) {
+    if (isBatchStoppedError_(error)) {
+      deleteBatchStateIfRunMatches_(runId);
+      return;
+    }
+
+    if (runId && !isBatchRunActive_(runId)) return;
+
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY, getErrorMessage_(error));
+    clearBatchRunIfMatches_(runId);
+    throw error;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function finishEmailValidatorN8nBatch_(ss, state) {
+  const runId = cleanText_(state && state.runId);
+  if (runId && !isBatchRunActive_(runId)) {
+    deleteBatchStateIfRunMatches_(runId);
+    return;
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  const result = buildN8nStatusFromState_(state, 'DONE');
+  result.finishedAt = new Date().toISOString();
+
+  props.setProperty(N8N_LAST_RUN_ID_PROPERTY_, runId);
+  props.setProperty(N8N_LAST_RESULT_PROPERTY_, JSON.stringify(result));
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.SPREADSHEET_ID_PROPERTY);
+  props.deleteProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY);
+
+  if (!runId || isBatchRunActive_(runId)) {
+    props.deleteProperty(EMAIL_VALIDATOR_CONFIG.ACTIVE_RUN_ID_PROPERTY);
+  }
+
+  updateSummarySheet_(ss);
 }
 
 function buildN8nStatusFromState_(state, status) {
