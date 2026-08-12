@@ -14,6 +14,7 @@
  * - Jalur n8n memproses maksimal 1 email baru per request agar koneksi HTTP pendek/stabil.
  * - Company + email yang cache-nya masih valid langsung dilewati, walaupun pindah Source Row.
  * - Company yang sama dengan email baru tetap divalidasi, tetapi memakai Company Master sebagai cache perusahaan.
+ * - Strict identity hardening diaktifkan setiap execution n8n melalui N8N_HARDENING.gs.
  * - Adapter ini sengaja tidak membuat Apps Script trigger dari scripts.run.
  */
 
@@ -22,6 +23,7 @@ const N8N_LAST_SPREADSHEET_ID_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_SPREADSHEET_
 const N8N_LAST_RESULT_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_RESULT';
 const N8N_LAST_STARTED_AT_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_STARTED_AT';
 const N8N_BATCH_SIZE_ = 1;
+const N8N_HARDENING_VERSION_ = 'N8N-H1';
 
 /**
  * Memulai validasi seluruh email baru dari n8n.
@@ -29,6 +31,7 @@ const N8N_BATCH_SIZE_ = 1;
  * Start hanya membuat state; pekerjaan berat dilakukan oleh continueEmailValidatorN8n().
  */
 function startEmailValidatorN8n(spreadsheetId) {
+  applyValidatorHardeningN8n_();
   assertValidatorApiKey_();
 
   const id = cleanText_(spreadsheetId);
@@ -86,6 +89,7 @@ function startEmailValidatorN8n(spreadsheetId) {
       review: 0,
       invalid: 0,
       errors: 0,
+      hardening: N8N_HARDENING_VERSION_,
       message: 'Tidak ada data email yang perlu dipindai.',
       startedAt: startedAt,
       finishedAt: new Date().toISOString()
@@ -121,6 +125,8 @@ function startEmailValidatorN8n(spreadsheetId) {
  * Memproses satu batch n8n berikutnya lalu mengembalikan status.
  */
 function continueEmailValidatorN8n() {
+  applyValidatorHardeningN8n_();
+
   const props = PropertiesService.getScriptProperties();
   const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
 
@@ -153,6 +159,7 @@ function getEmailValidatorStatusN8n() {
         ok: false,
         runId: lastRunId,
         status: 'ERROR',
+        hardening: N8N_HARDENING_VERSION_,
         error: 'Batch state tidak dapat dibaca: ' + getErrorMessage_(error)
       };
     }
@@ -163,6 +170,7 @@ function getEmailValidatorStatusN8n() {
       ok: false,
       runId: lastRunId,
       status: 'ERROR',
+      hardening: N8N_HARDENING_VERSION_,
       error: lastError
     };
   }
@@ -170,7 +178,9 @@ function getEmailValidatorStatusN8n() {
   const lastResultText = props.getProperty(N8N_LAST_RESULT_PROPERTY_);
   if (lastResultText) {
     try {
-      return JSON.parse(lastResultText);
+      const lastResult = JSON.parse(lastResultText);
+      lastResult.hardening = lastResult.hardening || N8N_HARDENING_VERSION_;
+      return lastResult;
     } catch (ignore) {
       // fallback di bawah
     }
@@ -186,14 +196,16 @@ function getEmailValidatorStatusN8n() {
     validProbable: 0,
     review: 0,
     invalid: 0,
-    errors: 0
+    errors: 0,
+    hardening: N8N_HARDENING_VERSION_
   };
 }
 
 /**
  * Filter khusus n8n.
- * Mode normal melewati company+email yang sudah memiliki Email Cache valid,
- * walaupun data harian pindah nomor row. RETRY tetap mengikuti engine utama.
+ * Implementasi default dipertahankan sebagai fallback. Saat execution n8n
+ * dimulai, N8N_HARDENING.gs menggantinya dengan filter yang juga mendeteksi
+ * false-positive cache lama.
  */
 function shouldProcessValidationRowN8n_(sourceRow, rowValues, headerMap, rawIndex, mode) {
   const company = cleanText_(rowValues[headerMap['Company Name'] - 1]);
@@ -216,6 +228,10 @@ function shouldProcessValidationRowN8n_(sourceRow, rowValues, headerMap, rawInde
  * Tidak membuat continuation trigger; continuation dilakukan oleh n8n.
  */
 function processEmailValidatorN8nBatch_() {
+  // Fungsi ini juga dapat dipanggil langsung saat debugging; pastikan hardening
+  // tetap aktif walaupun caller bukan continueEmailValidatorN8n().
+  applyValidatorHardeningN8n_();
+
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
     throw new Error('Email Validator sedang diproses oleh eksekusi lain. Coba lagi pada batch berikutnya.');
@@ -377,6 +393,7 @@ function buildN8nStatusFromState_(state, status) {
     errors: Number(state && state.errors || 0),
     nextRow: Number(state && state.nextRow || 0),
     endRow: Number(state && state.endRow || 0),
-    startedAt: cleanText_(state && state.startedAt)
+    startedAt: cleanText_(state && state.startedAt),
+    hardening: N8N_HARDENING_VERSION_
   };
 }
