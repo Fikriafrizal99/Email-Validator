@@ -73,7 +73,9 @@
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ { function: 'startEmailValidatorN8n', parameters: [$('Config').item.json.spreadsheetId] } }}",
-        "options": {}
+        "options": {
+          "timeout": 120000
+        }
       },
       "id": "85598d20-3d54-40d5-8c4b-4f0781aa0369",
       "name": "Start Email Validator",
@@ -161,7 +163,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const endRow = Number($json.endRow || 0);\nconst nextRow = Number($json.nextRow || 0);\nconst batchSize = 5;\n\nlet maxIterations;\nif (endRow > 0 && nextRow > 0) {\n  const remainingRows = Math.max(0, endRow - nextRow + 1);\n  maxIterations = Math.max(1, Math.ceil(remainingRows / batchSize) + 2);\n} else {\n  maxIterations = 25;\n}\n\nreturn Array.from({ length: maxIterations }, (_, i) => ({\n  json: {\n    iteration: i + 1,\n    maxIterations,\n    runId: $json.runId || ''\n  }\n}));"
+        "jsCode": "const endRow = Number($json.endRow || 0);\nconst nextRow = Number($json.nextRow || 0);\n\nlet maxIterations;\nif (endRow > 0 && nextRow > 0) {\n  const remainingRows = Math.max(0, endRow - nextRow + 1);\n  maxIterations = Math.max(1, remainingRows + 3);\n} else {\n  maxIterations = 100;\n}\n\nreturn Array.from({ length: maxIterations }, (_, i) => ({\n  json: {\n    iteration: i + 1,\n    maxIterations,\n    runId: $json.runId || ''\n  }\n}));"
       },
       "id": "06dcd1d6-eef7-4c52-98bc-b3b75d81e52a",
       "name": "Build Batch Queue",
@@ -189,13 +191,18 @@
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ { function: 'continueEmailValidatorN8n', parameters: [] } }}",
-        "options": {}
+        "options": {
+          "timeout": 300000
+        }
       },
       "id": "4ce9bd03-2d9e-466e-bc3a-4d39abf0b21a",
       "name": "Continue Email Validator",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.5,
       "position": [2400, 672],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 15000,
       "credentials": {
         "oAuth2Api": {
           "id": "c8RsEiPHO2rjIdey",
@@ -292,7 +299,7 @@
         "sendBody": true,
         "contentType": "json",
         "specifyBody": "json",
-        "jsonBody": "={{ { chat_id: $('Config').item.json.telegramChatId, text: `📧 EMAIL VALIDATOR SELESAI\\n━━━━━━━━━━━━━━━━\\nRun ID: ${$json.runId || '-'}\\nDiproses: ${$json.processed ?? 0}\\n✅ Terverifikasi: ${$json.validConfirmed ?? 0}\\n🟢 Kemungkinan valid: ${$json.validProbable ?? 0}\\n🟡 Cek manual: ${$json.review ?? 0}\\n❌ Jangan digunakan: ${$json.invalid ?? 0}\\n⚠️ Error: ${$json.errors ?? 0}\\n\\nStatus: ${$json.status || 'DONE'}` } }}",
+        "jsonBody": "={{ { chat_id: $('Config').item.json.telegramChatId, text: `📧 EMAIL VALIDATOR SELESAI\\n━━━━━━━━━━━━━━━━\\nRun ID: ${$json.runId || '-'}\\nDiproses baru: ${$json.processed ?? 0}\\n⏭️ Dilewati/cache: ${$json.skipped ?? 0}\\n✅ Terverifikasi: ${$json.validConfirmed ?? 0}\\n🟢 Kemungkinan valid: ${$json.validProbable ?? 0}\\n🟡 Cek manual: ${$json.review ?? 0}\\n❌ Jangan digunakan: ${$json.invalid ?? 0}\\n⚠️ Error: ${$json.errors ?? 0}\\n\\nStatus: ${$json.status || 'DONE'}` } }}",
         "options": {}
       },
       "id": "4f6484c7-ffe7-4027-9fde-334be78c68a5",
@@ -319,9 +326,9 @@
     },
     {
       "parameters": {
-        "content": "## Email Validator — Daily OAuth\n- Otomatis 1× sehari pukul **18:00 WIB**.\n- Batch lanjutan memakai **Loop Over Items** agar benar-benar dieksekusi berulang secara serial.\n- Tidak ada Wait 60 detik.\n- OAuth: credential `Email Validator AppScript`.\n- Isi `telegramBotToken` di Config dengan token BARU.\n- Manual Trigger tetap tersedia untuk testing.",
-        "height": 260,
-        "width": 560
+        "content": "## Email Validator — Daily OAuth\n- Otomatis 1× sehari pukul **18:00 WIB**.\n- Start hanya membuat state, jadi request awal ringan.\n- Continue memproses maksimal **1 email baru per request** supaya tidak sering `connection aborted`.\n- Company + email yang masih ada di Email Cache langsung di-skip walaupun berpindah row.\n- Company lama + email baru tetap diproses, tetapi Company Master dipakai sehingga perusahaan tidak dicari ulang.\n- Continue retry otomatis 1× bila koneksi HTTP terputus.\n- Isi `telegramBotToken` di Config dengan token BARU.",
+        "height": 300,
+        "width": 620
       },
       "id": "ac222344-9486-43e7-8be5-70d6d48d44aa",
       "name": "Setup Notes",
@@ -397,7 +404,7 @@
     "availableInMCP": false,
     "timezone": "Asia/Jakarta"
   },
-  "versionId": "4a039429-d99e-493a-8089-1cf36b445d2f",
+  "versionId": "a80573ee-df74-4970-a2a4-b6cc6950e5bc",
   "meta": {
     "instanceId": "ad1f0c6658d383104eabd3878f3aa6086a990e40d0c61a955e6306422a1e08a8"
   },
