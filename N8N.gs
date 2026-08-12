@@ -15,6 +15,7 @@
 const N8N_LAST_RUN_ID_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_RUN_ID';
 const N8N_LAST_SPREADSHEET_ID_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_SPREADSHEET_ID';
 const N8N_LAST_RESULT_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_RESULT';
+const N8N_LAST_STARTED_AT_PROPERTY_ = 'N8N_EMAIL_VALIDATOR_LAST_STARTED_AT';
 
 /**
  * Memulai validasi seluruh email baru dari n8n.
@@ -86,12 +87,15 @@ function startEmailValidatorN8n(spreadsheetId) {
     return emptyResult;
   }
 
+  const startedAt = new Date().toISOString();
+  props.setProperty(N8N_LAST_STARTED_AT_PROPERTY_, startedAt);
+
   const state = {
     runId: runId,
     mode: 'PENDING',
     nextRow: EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
     endRow: endRow,
-    startedAt: new Date().toISOString(),
+    startedAt: startedAt,
     processed: 0,
     skipped: 0,
     verified: 0,
@@ -119,6 +123,8 @@ function getEmailValidatorStatusN8n() {
   const stateText = props.getProperty(EMAIL_VALIDATOR_CONFIG.BATCH_STATE_PROPERTY);
   const lastError = cleanText_(props.getProperty(EMAIL_VALIDATOR_CONFIG.LAST_ERROR_PROPERTY));
   const lastRunId = cleanText_(props.getProperty(N8N_LAST_RUN_ID_PROPERTY_));
+  const lastSpreadsheetId = cleanText_(props.getProperty(N8N_LAST_SPREADSHEET_ID_PROPERTY_));
+  const lastStartedAt = cleanText_(props.getProperty(N8N_LAST_STARTED_AT_PROPERTY_));
 
   if (stateText) {
     try {
@@ -148,6 +154,24 @@ function getEmailValidatorStatusN8n() {
     };
   }
 
+  // Jika batch state sudah dihapus oleh finishValidationBatch_, hitung hasil akhir
+  // dari Raw berdasarkan Last Checked sejak waktu run dimulai. Dengan begitu
+  // statistik final tetap akurat tanpa mengubah engine utama.
+  if (lastRunId && lastSpreadsheetId && lastStartedAt) {
+    try {
+      const finalResult = buildN8nFinalStatusFromRaw_(
+        lastSpreadsheetId,
+        lastRunId,
+        lastStartedAt
+      );
+      props.setProperty(N8N_LAST_RESULT_PROPERTY_, JSON.stringify(finalResult));
+      return finalResult;
+    } catch (error) {
+      // Jika pembacaan Raw gagal, fallback ke snapshot polling terakhir.
+      console.warn(getErrorMessage_(error));
+    }
+  }
+
   const lastResultText = props.getProperty(N8N_LAST_RESULT_PROPERTY_);
   if (lastResultText) {
     try {
@@ -174,6 +198,76 @@ function getEmailValidatorStatusN8n() {
     invalid: 0,
     errors: 0
   };
+}
+
+function buildN8nFinalStatusFromRaw_(spreadsheetId, runId, startedAt) {
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const rawSheet = ss.getSheetByName(EMAIL_VALIDATOR_CONFIG.RAW_SHEET_NAME);
+  if (!rawSheet || rawSheet.getLastRow() < EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW) {
+    return {
+      ok: true,
+      runId: runId,
+      status: 'DONE',
+      processed: 0,
+      skipped: 0,
+      validConfirmed: 0,
+      validProbable: 0,
+      review: 0,
+      invalid: 0,
+      errors: 0,
+      startedAt: startedAt,
+      finishedAt: new Date().toISOString()
+    };
+  }
+
+  const map = getHeaderMap_(rawSheet);
+  const statusCol = requireHeader_(map, 'Validation Status');
+  const checkedCol = requireHeader_(map, 'Last Checked');
+  const rowCount = rawSheet.getLastRow() - EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW + 1;
+  const rows = rawSheet.getRange(
+    EMAIL_VALIDATOR_CONFIG.FIRST_DATA_ROW,
+    1,
+    rowCount,
+    rawSheet.getLastColumn()
+  ).getValues();
+
+  const startedMs = new Date(startedAt).getTime();
+  const result = {
+    ok: true,
+    runId: runId,
+    status: 'DONE',
+    processed: 0,
+    skipped: 0,
+    validConfirmed: 0,
+    validProbable: 0,
+    review: 0,
+    invalid: 0,
+    errors: 0,
+    startedAt: startedAt,
+    finishedAt: new Date().toISOString()
+  };
+
+  rows.forEach(function (row) {
+    const checkedValue = row[checkedCol - 1];
+    const checkedMs = checkedValue instanceof Date
+      ? checkedValue.getTime()
+      : new Date(checkedValue).getTime();
+    if (!isFinite(checkedMs) || !isFinite(startedMs) || checkedMs < startedMs) return;
+
+    const technicalStatus = cleanText_(row[statusCol - 1]).toUpperCase();
+    if (!technicalStatus) return;
+
+    result.processed++;
+    if (technicalStatus === 'ERROR') result.errors++;
+
+    const friendly = mapFinalStatus_(technicalStatus);
+    if (friendly === 'TERVERIFIKASI') result.validConfirmed++;
+    else if (friendly === 'KEMUNGKINAN VALID') result.validProbable++;
+    else if (friendly === 'CEK MANUAL') result.review++;
+    else if (friendly === 'JANGAN DIGUNAKAN') result.invalid++;
+  });
+
+  return result;
 }
 
 function buildN8nStatusFromState_(state, status) {
